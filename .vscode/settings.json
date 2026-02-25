@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "./safe_test_2/manager"
+    ]
+}

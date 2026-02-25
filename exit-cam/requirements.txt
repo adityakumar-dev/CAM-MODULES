@@ -1,0 +1,7 @@
+opencv-python
+ultralytics
+lap>=0.5.12
+emotiefflib
+uvicorn[standard]
+fastapi
+python-multipart

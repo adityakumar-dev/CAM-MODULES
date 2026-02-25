@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "entry-cam: check imports",
+			"type": "shell",
+			"command": "cd /home/linmar/temp/project/test-2/entry-cam && ls *.pt *.yaml 2>/dev/null && python3 -c \"from src.core.face_embedder import FaceEmbedder; from src.core.identity_manager import IdentityManager; from src.core.staff_checker import StaffChecker; print('ALL IMPORTS OK')\" && echo 'ready to run'"
+		}
+	]
+}

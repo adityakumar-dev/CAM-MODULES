@@ -1,0 +1,57 @@
+# bytetrack.yaml — tuned for dense outdoor crowd, yolo11n
+# ─────────────────────────────────────────────────────────
+# Problem with defaults in a busy market / street scene:
+#   - Default track_high_thresh: 0.25  →  yolo11n frequently scores people at
+#     0.26–0.35 in a crowd (partial occlusion, small bodies at distance).
+#     When conf dips below 0.25 even briefly, ByteTrack drops the track entirely.
+#   - Default track_buffer: 30 (1 second at 30fps)  →  far too short.
+#     A person occluded for 1.5 seconds gets a new ID when they reappear.
+#   - Default new_track_thresh: 0.25  →  too low, creates ghost tracks on noise.
+#
+# Tuning rationale for each parameter:
+#
+#   track_high_thresh: 0.20
+#     Lower than default to compensate for yolo11n's weaker scores on small/
+#     partially occluded persons.  Detections between 0.20–0.25 that the nano
+#     model produces on partially visible people will now be tracked properly.
+#     Risk: slightly more false positives — acceptable in a counted-footfall
+#     scenario; a ghost track for 3 seconds is far less damaging than missing
+#     a real person entirely.
+#
+#   track_low_thresh: 0.08
+#     Second-association stage catches very briefly occluded persons (conf
+#     dropped because someone walked in front).  Lowered slightly to help
+#     nano model detections survive brief occlusion.
+#
+#   new_track_thresh: 0.25
+#     Only start a NEW track if conf >= 0.25.  Keeps new_track_thresh ABOVE
+#     track_high_thresh intentionally — this prevents very weak noise detections
+#     (0.20–0.24) from spawning brand-new IDs.  They can only update existing
+#     tracks, not create new ones.
+#
+#   track_buffer: 90
+#     Keep lost tracks alive for 90 frames (3 seconds at 30fps, or ~4.5s at
+#     20fps).  In a busy market, a person can be fully occluded for 2–3 seconds
+#     by a crowd, then reappear.  With buffer=30 they got a new ID every time.
+#     With buffer=90 ByteTrack re-associates them correctly.
+#     This is the single biggest fix for duplicate IDs in your scene.
+#
+#   match_thresh: 0.85
+#     Slightly tighter than default (0.8).  With more lost tracks kept alive
+#     (buffer=90) we need slightly stricter IoU matching to prevent wrong
+#     re-associations between two different people.
+#
+#   fuse_score: True
+#     Fuses detection confidence into the matching cost.  Helps the nano model
+#     whose confidence varies more than larger models — a high-conf detection
+#     gets priority in the match, stabilising IDs for people walking toward
+#     the camera (conf rises as they get closer).
+
+tracker_type: bytetrack
+
+track_high_thresh: 0.20   # was 0.25 — lower for nano model in crowds
+track_low_thresh:  0.08   # was 0.10 — slightly more forgiving for occlusion
+new_track_thresh:  0.25   # keep above track_high_thresh to avoid noise IDs
+track_buffer:      90     # was 30 — 3 s at 30fps, handles occlusion in crowds
+match_thresh:      0.85   # was 0.80 — slightly tighter with longer buffer
+fuse_score:        True   # fuse conf into match cost — stabilises nano scores
