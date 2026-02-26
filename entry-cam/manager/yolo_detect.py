@@ -69,7 +69,14 @@ class YoloDetector:
         self.conf_threshold = config.YOLO_CONFIDENCE_THRESHOLD
         self.iou_threshold  = config.YOLO_IOU_THRESHOLD
         self.device         = config.YOLO_DEVICE
+        self.imgsz          = config.YOLO_IMGSZ
         self.model          = YOLO(self.model_path)
+
+        # Frame-skip: run YOLO on 1 of every _skip_n frames.
+        # Skipped frames reuse the previous result (stale by at most 1/fps seconds).
+        self._skip_n       = max(1, int(getattr(config, "YOLO_SKIP_FRAMES", 1)))
+        self._skip_counter = 0
+        self._last_tracks: list = []
 
     # ------------------------------------------------------------------
     # Plain detection (no tracking)
@@ -80,7 +87,7 @@ class YoloDetector:
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
-            imgsz=config.YOLO_IMGSZ,
+            imgsz=self.imgsz,
             classes=[0],   # person only
             verbose=False,
         )[0]
@@ -106,12 +113,17 @@ class YoloDetector:
         NO detections are dropped. Every visible person is returned.
         IdentityManager handles merging tmp -> real IDs via spatial matching.
         """
+        # Frame-skip: return cached result without running YOLO
+        self._skip_counter += 1
+        if self._skip_n > 1 and (self._skip_counter % self._skip_n != 0):
+            return list(self._last_tracks)
+
         results = self.model.track(
             frame,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
-            imgsz=config.YOLO_IMGSZ,
+            imgsz=self.imgsz,
             classes=[0],          # person only
             persist=True,         # keep tracker state between calls
             tracker="bytetrack.yaml",
@@ -149,4 +161,5 @@ class YoloDetector:
                     is_temp_id=True,
                 ))
 
+        self._last_tracks = tracks
         return tracks

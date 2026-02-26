@@ -10,10 +10,10 @@ import os
 # YOLO detection
 # ---------------------------------------------------------------------------
 YOLO_MODEL_PATH           = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
-YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.15"))
+YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.35"))
 YOLO_IOU_THRESHOLD        = float(os.getenv("YOLO_IOU",  "0.45"))
 YOLO_DEVICE               = os.getenv("YOLO_DEVICE", "cpu")   # "cpu" | "cuda" | "mps"
-YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "640"))  # inference resolution
+YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "320"))  # inference resolution — 320 is ~3× faster than 640 on CPU
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "640"))  # inference res
 # Leave empty to disable all backend forwarding.
 BACKEND_WS_URL   = os.getenv("BACKEND_WS_URL",   "wss://enabled-flowing-bedbug.ngrok-free.app/cam/stream")
 # Shared secret sent as Bearer token in the WS upgrade header.
-BACKEND_WS_TOKEN = os.getenv("BACKEND_WS_TOKEN", "")
+BACKEND_WS_TOKEN = os.getenv("BACKEND_WS_TOKEN", "token_for_linmar_backend_ws_auth")
 
 # Identifier sent with every message so your backend knows which camera.
 BACKEND_CAM_ID   = os.getenv("BACKEND_CAM_ID",   "entry-cam")
@@ -58,7 +58,16 @@ SOURCE_FPS   = os.getenv("SOURCE_FPS", None)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Display ───────────────────────────────────────────────────────────────────
-SHOW_WINDOW = True
+SHOW_WINDOW = False  # Set True only for local debug — saves ~2 ms/frame on pipeline
+
+# ── Performance tuning ────────────────────────────────────────────────────────
+# Run YOLO only on 1 of every N frames; return cached tracks on skipped frames.
+# 1 = off (every frame), 2 = half, 3 = third. Good default for 15-20 fps RTSP: 2.
+YOLO_SKIP_FRAMES = int(os.getenv("YOLO_SKIP_FRAMES", "2"))
+
+# Max frames-per-second at which push_frame() re-encodes the JPEG for the
+# MJPEG stream and backend. Lower = less encoding CPU on the pipeline thread.
+PUSH_FRAME_FPS = float(os.getenv("PUSH_FRAME_FPS", "10"))
 
 # ── Tracking ──────────────────────────────────────────────────────────────────
 TRAIL_MAX_LEN = 30

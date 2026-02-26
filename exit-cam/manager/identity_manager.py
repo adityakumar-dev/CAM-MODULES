@@ -601,7 +601,9 @@ class IdentityManager:
         # ── Result list ────────────────────────────────────────────────────────
         results = []
         for cid in active_cids:
-            s = self._active[cid]
+            s = self._active.get(cid)  # guard: may have been removed by merge
+            if s is None:
+                continue
             results.append(dict(
                 track_id          = cid,
                 x1=s.box[0], y1=s.box[1], x2=s.box[2], y2=s.box[3],

@@ -2,6 +2,8 @@ opencv-python
 ultralytics
 lap>=0.5.12
 emotiefflib
+timm
+websockets
 uvicorn[standard]
 fastapi
 python-multipart

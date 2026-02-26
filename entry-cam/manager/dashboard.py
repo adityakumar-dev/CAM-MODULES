@@ -70,11 +70,18 @@ def _web_path(raw: str) -> str:
 # ── MJPEG stream ───────────────────────────────────────────────────────────────
 _latest_frame: Optional[bytes] = None
 _frame_lock = threading.Lock()
+_push_frame_last: float = 0.0
 
 
 def push_frame(frame) -> None:
-    """Encode a raw OpenCV frame, cache it for MJPEG streaming, and forward to backend WS."""
-    global _latest_frame
+    """Encode a raw OpenCV frame at most PUSH_FRAME_FPS times per second, cache for
+    MJPEG streaming, and forward to backend WS.  Skips encoding on fast frames."""
+    global _latest_frame, _push_frame_last
+    _interval = 1.0 / max(float(getattr(config, "PUSH_FRAME_FPS", 10)), 1.0)
+    now = time.time()
+    if now - _push_frame_last < _interval:
+        return
+    _push_frame_last = now
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
     if ok:
         frame_bytes = buf.tobytes()
@@ -120,10 +127,15 @@ async def _backend_ws_loop() -> None:
     - Runs entirely inside the uvicorn event loop — never blocks the pipeline.
     """
     import websockets
+    import ssl as _ssl
 
     backoff = 1.0
     attempt = 0
     headers = {"Authorization": f"Bearer {BACKEND_WS_TOKEN}"}
+    # Allow self-signed / ngrok certs; backend token is the auth layer
+    _ssl_ctx = _ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode    = _ssl.CERT_NONE
 
     while True:
         attempt += 1
@@ -131,6 +143,7 @@ async def _backend_ws_loop() -> None:
             async with websockets.connect(
                 BACKEND_WS_URL,
                 additional_headers=headers,
+                ssl=_ssl_ctx if BACKEND_WS_URL.startswith("wss") else None,
                 ping_interval=20,
                 ping_timeout=10,
             ) as ws:

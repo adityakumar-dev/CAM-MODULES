@@ -323,7 +323,9 @@ class IdentityManager:
                 self._write_pool.submit(_rename_worker, old_path, new_path)
             self._img_path[real_id] = new_path
 
-        self._zones.transfer(best_tmp, real_id)
+        # ZoneManager has no transfer() — remove the old tmp entry;
+        # the real_id will register itself on the very next frame update.
+        self._zones.remove(best_tmp)
         print(f"[IdentityManager] Merged tmp={best_tmp} → {real_id} ({best_dist:.0f}px)")
 
     # ── Count person ──────────────────────────────────────────────────────────
