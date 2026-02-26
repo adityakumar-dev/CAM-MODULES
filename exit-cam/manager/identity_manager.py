@@ -1,92 +1,74 @@
 """
-identity_manager.py
-===================
-Same core logic as the original IdentityManager, with these additions:
+IdentityManager  —  Exit Edition
+==================================
+Image lifecycle (ONE image per person, ever):
+  1. Person enters exit zone
+     → output/best/id_<cid>.jpg created / replaced if conf improves
+  2. Person leaves frame → enters _lost buffer (30 s window)
+     → image file stays in output/best/, NOT archived yet
+     → if they return within 30 s: ReID reclaim, same PersonState,
+       image keeps improving, no duplicate
+  3. Lost buffer expires (30 s with no re-detection)
+     → THEN and only then: emotion analysed, image moved to archive
+     → DB row written
 
-  Zone tracking
-  -------------
-  • Each PersonState now tracks which zone(s) the person has been counted in.
-  • Zone detection uses foot-point (bottom-centre of bounding box) + a
-    configurable dwell guard (ZONE_DWELL_FRAMES consecutive frames) to avoid
-    single-frame blips incrementing the counter.
-  • Zone entry is counted once per track per zone per visit.
-  • zone_counts DB table is incremented atomically on confirmed entry.
+Counting rule (single zone):
+  Person is counted as a unique exit when they were inside the exit zone
+  at any point during their visit and then disappear from frame.
+  Safety-net: on lost-buffer expiry, if was_in_exit_zone and not yet
+  counted → count (catches brief-leave / cross-frame-boundary cases).
 
-  Zone-gated capture
-  ------------------
-  • If config.CAPTURE_ZONES is non-empty, best-frame crops are ONLY saved
-    while the person is inside one of those zones.
-  • If config.CAPTURE_ZONES is empty, crops are saved everywhere (same as
-    original behaviour).
-
-  Re-ID scope
-  -----------
-  • Re-ID only covers the current session's _lost buffer (same-visit occlusion
-    recovery, exactly as the original).
-  • NO cross-session / gallery duplicate checking.
-
-  Everything else — async write pool, archive dir structure, crash recovery,
-  live_buffer, emotion analysis — is identical to the original.
+De-duplication:
+  - state.counted flag survives ReID reclaims within the 30 s lost buffer
+    → same person re-detected = no recount
+  - After lost buffer expires, gallery.find_match() at threshold 0.92
+    catches the same person returning → update row, no new count
 """
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import time
-from collections import defaultdict, deque
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 import config
-from manager.db_helper import (
-    save_person_metadata,
-    upsert_live_buffer,
-    delete_live_buffer,
-    get_all_live_buffer,
-    increment_zone_count,
-    close as _db_close,
-)
+from .db_helper  import save_person_metadata, increment_zone_count, close as _db_close
+from .exit_db    import ExitDB
+from .zone_manager import ZoneManager
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Module-level constants (read once from config)
+# Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-_SOURCE_FPS: int = max(1, getattr(config, "SOURCE_FPS", 30))
+_BUFFER_SECONDS : float = float(getattr(config, "EXIT_REID_BUFFER_SECONDS", 30.0))
+_REID_SIM       : float = float(getattr(config, "EXIT_REID_SIM_THRESHOLD",  0.65))
+_SESSION_SIM    : float = float(getattr(config, "EXIT_SESSION_THRESHOLD",   0.92))
+_HIST_SKIP_PX   : int   = int  (getattr(config, "EXIT_HIST_SKIP_PX",        4))
+_EMB_ALPHA      : float = float(getattr(config, "REID_EMBEDDING_ALPHA",     0.3))
+_TRAIL_LEN      : int   = int  (getattr(config, "TRAIL_MAX_LEN",            30))
+_MERGE_PX       : int   = 60   # centroid distance threshold for temp→real ID merge
 
-if hasattr(config, "REID_BUFFER_FRAMES"):
-    _BUFFER_SECONDS: float = config.REID_BUFFER_FRAMES / _SOURCE_FPS
-elif hasattr(config, "REID_BUFFER_SECONDS"):
-    _BUFFER_SECONDS = float(config.REID_BUFFER_SECONDS)
-else:
-    _BUFFER_SECONDS = 3.0
-
-_HIST_SKIP_PX: int  = getattr(config, "HIST_SKIP_PX",  4)
-_MIN_CROP_PX:  int  = getattr(config, "MIN_CROP_PX",   20)
-
-_REID_WITHIN_BUFFER_THRESHOLD: float = getattr(config, "REID_SAME_VISIT_THRESHOLD", 0.50)
-_REID_CROSS_VISIT_THRESHOLD:   float = getattr(config, "REID_SIM_THRESHOLD",        0.75)
-_ID_MAP_PRUNE_SECONDS: float = _BUFFER_SECONDS * 2.0
+_EXIT_ZONE      : str   = getattr(config, "EXIT_ZONE_NAME", "exit")
 
 _HAPPY_THRESHOLD:      float = getattr(config, "EMOTION_HAPPY_THRESHOLD",      0.40)
 _VERY_HAPPY_THRESHOLD: float = getattr(config, "EMOTION_VERY_HAPPY_THRESHOLD", 0.75)
 _SAD_THRESHOLD:        float = getattr(config, "EMOTION_SAD_THRESHOLD",        0.40)
-_EMOTIEFF_MODEL: str  = getattr(config, "EMOTIEFF_MODEL", "enet_b0_8_best_afew")
+_EMOTIEFF_MODEL: str          = getattr(config, "EMOTIEFF_MODEL", "enet_b0_8_best_afew")
 
-_ZONES: dict          = getattr(config, "ZONES", {})
-_CAPTURE_ZONES: list  = getattr(config, "CAPTURE_ZONES", [])
-_ZONE_DWELL_FRAMES: int = getattr(config, "ZONE_DWELL_FRAMES", 3)
-
-print(f"[IDMGR] Config | buffer={_BUFFER_SECONDS:.1f}s | "
-      f"zones={list(_ZONES.keys())} | capture_zones={_CAPTURE_ZONES} | "
-      f"dwell_guard={_ZONE_DWELL_FRAMES}f | min_crop={_MIN_CROP_PX}px")
+# Callback registered by dashboard so background archive threads can forward
+# the emotion result to the backend WS.  Set via: identity_manager._on_archived = fn
+_on_archived: Optional[callable] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Emotion recognizer — lazy singleton (same as original)
+# Emotion recogniser — lazy singleton (loaded once on first archive, not live)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _fer_instance: Optional[object] = None
@@ -107,31 +89,109 @@ def _get_fer():
     return _fer_instance if _fer_instance is not False else None
 
 
+def _analyse_emotion(image_path: str) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Run emotion recognition on an archived person-crop image.
+
+    Diagnostic confirmed (CCTV footage, 222×493 person crops):
+      - Haar cascade detects 0 faces — useless on compressed CCTV frames.
+      - emotiefflib's EfficientNet-B0 preprocesses the image itself; it does
+        NOT need a pre-cropped face.  Passing the top-30 % head strip gives
+        correct predictions (e.g. 'Surprise' 0.34, 'Neutral' 0.26).
+      - Full-body crop yields low-confidence Neutral — incorrect.
+      - Therefore: slice the top 30 % of the bounding-box crop and pass
+        that directly to predict_emotions().
+
+    Mapping (AffectNet 8-class model output → 3 display labels):
+        happy              → Happy / Very Happy  (split by confidence)
+        surprise           → Happy
+        sad / angry / anger
+        fear / disgust
+        contempt           → Sad
+        neutral / other    → None  (no label stored = "Undetected" in UI)
+    """
+    fer = _get_fer()
+    if fer is None:
+        return None, None
+
+    try:
+        img = cv2.imread(image_path)
+        if img is None or img.size == 0:
+            return None, None
+
+        h = img.shape[0]
+
+        # Top-30 % of person crop = head + shoulder region.
+        # emotiefflib handles its own internal preprocessing.
+        top_h      = max(h * 30 // 100, 48)
+        head_strip = img[:top_h, :]
+        head_rgb   = cv2.cvtColor(head_strip, cv2.COLOR_BGR2RGB)
+
+        emotion_labels, scores = fer.predict_emotions(head_rgb, logits=False)
+
+        if not emotion_labels or scores is None or scores.size == 0:
+            return None, None
+
+        predicted   = emotion_labels[0].lower().strip()
+        # scores shape: (1, n_classes) for a single image
+        face_scores = scores[0] if scores.ndim > 1 else scores
+        top_conf    = float(np.max(face_scores))
+
+        print(f"[Emotion] {os.path.basename(image_path)} → {predicted} ({top_conf:.2f})")
+
+        if predicted == "happy":
+            label = "Very Happy" if top_conf >= _VERY_HAPPY_THRESHOLD else "Happy"
+            return label, top_conf
+
+        if predicted == "surprise":
+            return "Happy", top_conf
+
+        if predicted in ("sad", "angry", "anger", "fear", "disgust", "contempt"):
+            return "Sad", top_conf
+
+        # neutral → no displayable emotion
+        return None, None
+
+    except Exception as exc:
+        print(f"[Emotion] ERROR {os.path.basename(image_path)}: {exc}")
+        return None, None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Pure helpers (identical to original)
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _crop(frame: np.ndarray,
-          x1: int, y1: int, x2: int, y2: int) -> Optional[np.ndarray]:
-    fh, fw = frame.shape[:2]
-    x1c, y1c = max(0, x1), max(0, y1)
-    x2c, y2c = min(fw, x2), min(fh, y2)
-    if x2c - x1c < _MIN_CROP_PX or y2c - y1c < _MIN_CROP_PX:
-        return None
-    return frame[y1c:y2c, x1c:x2c].copy()
-
-
-def _colour_hist(crop: np.ndarray, bins: int = 32) -> np.ndarray:
+def _spatial_embedding(crop: np.ndarray, frame_h: int, bins: int = 32) -> np.ndarray:
+    dim = bins * 3 * 3 + 2
     if crop is None or crop.size == 0:
-        return np.zeros(bins * 3, dtype=np.float32)
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = []
-    for ch, rng in zip(range(3), [(0, 180), (0, 256), (0, 256)]):
-        h = cv2.calcHist([hsv], [ch], None, [bins], list(rng))
-        h = h.flatten().astype(np.float32)
-        s = h.sum()
-        hist.append(h / s if s > 0 else h)
-    return np.concatenate(hist)
+        return np.zeros(dim, dtype=np.float32)
+    h, w = crop.shape[:2]
+    if h < 6 or w < 2:
+        return np.zeros(dim, dtype=np.float32)
+    strips  = [crop[:h//3], crop[h//3:2*h//3], crop[2*h//3:]]
+    weights = (1.5, 1.0, 0.7)
+    parts   = []
+    for strip, weight in zip(strips, weights):
+        if strip.size == 0:
+            parts.append(np.zeros(bins * 3, dtype=np.float32))
+            continue
+        hsv   = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        hists = []
+        for ch, rng in zip(range(3), [(0, 180), (0, 256), (0, 256)]):
+            h_arr = cv2.calcHist([hsv], [ch], None, [bins], list(rng)).flatten().astype(np.float32)
+            s     = h_arr.sum()
+            hists.append(h_arr / s if s > 0 else h_arr)
+        parts.append(np.concatenate(hists) * weight)
+    aspect     = np.float32(min(w / (h + 1e-5), 2.0) / 2.0)
+    rel_height = np.float32(min(h / (frame_h + 1e-5), 1.0))
+    vec  = np.concatenate([*parts, [aspect, rel_height]])
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+
+def _crop_frame(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    fh, fw = frame.shape[:2]
+    return frame[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)]
 
 
 def _box_moved(old_box: Optional[Tuple], new_box: Tuple, px: int) -> bool:
@@ -140,133 +200,109 @@ def _box_moved(old_box: Optional[Tuple], new_box: Tuple, px: int) -> bool:
     return any(abs(a - b) > px for a, b in zip(old_box, new_box))
 
 
-def _point_in_zone(x: int, y: int, polygon: list) -> bool:
-    """Ray-casting point-in-polygon via OpenCV (handles concave polygons)."""
-    if len(polygon) < 3:
-        return False
-    pts = np.array(polygon, dtype=np.float32)
-    return cv2.pointPolygonTest(pts, (float(x), float(y)), False) >= 0
-
-
-def _current_zone(foot_x: int, foot_y: int) -> Optional[str]:
-    """Return the first zone name whose polygon contains (foot_x, foot_y)."""
-    for name, poly in _ZONES.items():
-        if _point_in_zone(foot_x, foot_y, poly):
-            return name
-    return None
-
-
-def _analyse_emotion(image_path: str,
-                     crop_h: int = 0) -> Tuple[Optional[str], Optional[float]]:
-    fer = _get_fer()
-    if fer is None:
-        return None, None
-    try:
-        img = cv2.imread(image_path)
-        if img is None or img.size == 0:
-            return None, None
-        h = img.shape[0]
-        head_bottom = max(int(h * 0.40), min(h, 60))
-        head_img = img[:head_bottom, :]
-        if head_img.size == 0:
-            head_img = img
-        head_rgb = cv2.cvtColor(head_img, cv2.COLOR_BGR2RGB)
-        emotion_labels, scores = fer.predict_emotions(head_rgb, logits=False)
-        if not emotion_labels or len(scores) == 0:
-            return None, None
-        face_scores = scores[0] if hasattr(scores[0], "__len__") else scores
-        names = ["angry", "disgust", "fear", "happy",
-                 "sad", "surprise", "neutral", "contempt"]
-        sd = {names[i]: float(face_scores[i])
-              for i in range(min(len(names), len(face_scores)))}
-        pos = sd.get("happy", 0.0) + sd.get("surprise", 0.0)
-        neg = (sd.get("sad", 0.0)     + sd.get("angry", 0.0) +
-               sd.get("fear", 0.0)    + sd.get("disgust", 0.0) +
-               sd.get("contempt", 0.0))
-        if pos >= neg and pos >= _HAPPY_THRESHOLD:
-            return ("Very Happy" if pos >= _VERY_HAPPY_THRESHOLD else "Happy"), pos
-        if neg > pos and neg >= _SAD_THRESHOLD:
-            return "Sad", neg
-        return None, None
-    except Exception:
-        return None, None
+def _centroid_dist(box: Tuple, cx: int, cy: int) -> float:
+    return (((box[0]+box[2])/2 - cx)**2 + ((box[1]+box[3])/2 - cy)**2) ** 0.5
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PersonState — extended with zone tracking fields
+# LostEntry — what we keep in the lost buffer
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LostEntry:
+    """
+    Holds everything needed to either:
+      a) Reclaim a person back into _active (re-detected within buffer)
+      b) Finalize them on expiry (archive image, write DB row)
+
+    was_in_exit_zone: True iff an image was actually captured for this person.
+      Images are only written when the person is inside the exit zone, so
+      bool(image_path) is the reliable evidence. Mirrors entry-cam's
+      was_in_capture_zone = bool(image_path).
+    """
+    __slots__ = ("live_embedding", "best_embedding", "best_conf",
+                 "image_path", "first_seen", "last_seen",
+                 "counted", "was_in_exit_zone", "last_zone", "t_lost")
+
+    def __init__(self, state: "PersonState", image_path: str, t_lost: float):
+        self.live_embedding   = state.live_embedding.copy()
+        self.best_embedding   = state.best_embedding.copy()
+        self.best_conf        = state.best_conf
+        self.image_path       = image_path
+        self.first_seen       = state.first_seen
+        self.last_seen        = state.last_seen
+        self.counted          = state.counted
+        self.was_in_exit_zone = bool(image_path)   # evidence-based, mirrors entry-cam
+        self.last_zone        = state.zone
+        self.t_lost           = t_lost
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PersonState
 # ──────────────────────────────────────────────────────────────────────────────
 
 class PersonState:
     __slots__ = (
         "track_id", "first_seen", "last_seen",
-        "centre_history", "zone", "embedding",
-        "box", "conf", "_prev_box",
-        # zone tracking
-        "counted_zones",        # set[str]  — zones already counted this visit
-        "_zone_dwell_name",     # str|None  — zone currently being dwelt in
-        "_zone_dwell_frames",   # int       — consecutive frames inside _zone_dwell_name
+        "centre_history", "zone", "prev_zone",
+        "live_embedding", "best_embedding",
+        "box", "conf", "best_conf", "best_frame",
+        "was_in_exit_zone", "counted",
+        "_prev_box",
     )
 
-    def __init__(self, track_id, centre, box, conf, embedding):
-        self.track_id   = track_id
-        self.first_seen = time.time()
-        self.last_seen  = time.time()
-        self.centre_history: deque = deque(maxlen=config.TRAIL_MAX_LEN)
+    def __init__(self, track_id: Any, centre: Tuple[int, int], box: Tuple,
+                 conf: float, embedding: np.ndarray):
+        self.track_id              = track_id
+        self.first_seen            = time.time()
+        self.last_seen             = time.time()
+        self.centre_history: deque = deque(maxlen=_TRAIL_LEN)
         self.centre_history.append(centre)
-        self.zone      = None
-        self.embedding = embedding
-        self.box       = box
-        self.conf      = conf
-        self._prev_box = box
-        # zone tracking
-        self.counted_zones: Set[str] = set()
-        self._zone_dwell_name: Optional[str] = None
-        self._zone_dwell_frames: int = 0
+        self.zone                  = None
+        self.prev_zone             = None
+        self.live_embedding        = embedding.copy()
+        self.best_embedding        = embedding.copy()
+        self.box                   = box
+        self.conf                  = conf
+        self.best_conf             = conf
+        self.best_frame: Optional[np.ndarray] = None
+        self.was_in_exit_zone      = False
+        self.counted               = False
+        self._prev_box             = box
 
-    def update(self, centre, box: Tuple, conf: float,
-               embedding: Optional[np.ndarray]) -> None:
+    def restore_from_lost(self, entry: LostEntry) -> None:
+        """Restore counted + embedding state from a reclaimed LostEntry."""
+        self.counted          = entry.counted
+        self.live_embedding   = entry.live_embedding.copy()
+        self.best_embedding   = entry.best_embedding.copy()
+        self.best_conf        = max(self.best_conf, entry.best_conf)
+        self.first_seen       = entry.first_seen
+        self.was_in_exit_zone = entry.was_in_exit_zone
+
+    def update(self, centre: Tuple[int, int], box: Tuple, conf: float,
+               embedding: Optional[np.ndarray], crop: np.ndarray, frame_h: int,
+               in_exit: bool) -> None:
         self.last_seen = time.time()
+        self.prev_zone = self.zone
         self.centre_history.append(centre)
-        self.box       = box
-        self.conf      = conf
-        self._prev_box = box
+        self.box  = box
+        self.conf = conf
+
         if embedding is not None:
-            a = config.REID_EMBEDDING_ALPHA
-            self.embedding = a * embedding + (1 - a) * self.embedding
+            self.live_embedding = _EMB_ALPHA * embedding + (1 - _EMB_ALPHA) * self.live_embedding
+            self._prev_box = box
 
-    def update_zone_dwell(self, zone_name: Optional[str]) -> Optional[str]:
-        """
-        Feed the zone the person is in this frame.
-        Returns the zone name once the dwell guard has been satisfied
-        (i.e. the zone should now be counted), otherwise returns None.
+        if in_exit:
+            self.was_in_exit_zone = True
 
-        Rules:
-          - If the person is in a new zone, reset the dwell counter.
-          - Once they have been in the same zone for _ZONE_DWELL_FRAMES
-            consecutive frames AND that zone hasn't been counted yet,
-            return the zone name so the caller can count it.
-        """
-        if zone_name is None:
-            # Not in any zone — reset dwell streak
-            self._zone_dwell_name   = None
-            self._zone_dwell_frames = 0
-            return None
+        prev_best = self.best_conf
 
-        if zone_name != self._zone_dwell_name:
-            # Entered a different zone — start fresh dwell counter
-            self._zone_dwell_name   = zone_name
-            self._zone_dwell_frames = 1
-            return None
-
-        # Same zone as last frame
-        self._zone_dwell_frames += 1
-
-        if (self._zone_dwell_frames >= _ZONE_DWELL_FRAMES
-                and zone_name not in self.counted_zones):
-            self.counted_zones.add(zone_name)
-            return zone_name   # signal: count this zone entry now
-
-        return None
+        # Best frame + best embedding: exit zone only.
+        # Prevents outside-zone high-conf frames from blocking zone captures.
+        # Mirrors entry-cam's in_capture guard for best_frame.
+        if in_exit and (self.best_frame is None or conf > prev_best):
+            self.best_conf      = conf
+            self.best_frame     = crop.copy()
+            self.best_embedding = _spatial_embedding(crop, frame_h)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -276,25 +312,45 @@ class PersonState:
 class IdentityManager:
 
     def __init__(self):
-        self._active:   Dict[int, PersonState]              = {}
-        self._id_map:   Dict[int, int]                      = {}
-        self._id_map_last_seen: Dict[int, float]            = {}
-        self._lost:     Dict[int, Tuple[np.ndarray, float]] = {}
-        self._best_info: Dict[int, dict]                    = {}
-        self._write_gen: Dict[int, int]                     = {}
+        self._active:   Dict[Any, PersonState] = {}
+        self._id_map:   Dict[Any, Any]         = {}
+        self._lost:     Dict[Any, LostEntry]   = {}
+        self._img_path: Dict[Any, str]         = {}
+
+        zones = getattr(config, "EXIT_ZONES", {})
+        if not zones:
+            print("[IdentityManager] WARNING: EXIT_ZONES not set. Run manager/draw_zone.py")
+        self._zones = ZoneManager(zones)
+
+        db_path = getattr(config, "EXIT_DB_PATH", "output/exit_session.db")
+        self._gallery = ExitDB(db_path=db_path)
+        self.unique_exit_count: int = self._gallery.total_unique()
+        print(f"[IdentityManager] Started. Known persons: {self.unique_exit_count}")
 
         self._best_dir = os.path.join("output", "best")
         os.makedirs(self._best_dir, exist_ok=True)
-
         self._archive_dir_cache: Dict[str, str] = {}
         self._write_pool = ThreadPoolExecutor(max_workers=1)
-        self._last_prune_time: float = time.time()
 
-        print(f"[IDMGR] IdentityManager initialised | best_dir={self._best_dir}")
+    # ── Public ────────────────────────────────────────────────────────────────
 
-        self._recover_live_buffer()
+    def draw_zones(self, frame: np.ndarray) -> None:
+        self._zones.draw(frame)
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    def active_count(self) -> int:
+        return len(self._active)
+
+    def get_state(self) -> Dict[Any, PersonState]:
+        return self._active
+
+    def reset_session(self) -> None:
+        self._gallery.reset()
+        self.unique_exit_count = 0
+        for s in self._active.values():
+            s.counted = False
+        print("[IdentityManager] Session reset.")
+
+    # ── Archive dir ───────────────────────────────────────────────────────────
 
     def _archive_dir(self, dt: datetime) -> str:
         key = dt.strftime("day_%Y%m%d/hour_%H")
@@ -304,307 +360,281 @@ class IdentityManager:
             self._archive_dir_cache[key] = full
         return self._archive_dir_cache[key]
 
-    def _expire_lost(self) -> None:
-        now = time.time()
-        for lost_cid in list(self._lost):
-            _, t_lost = self._lost[lost_cid]
-            if now - t_lost > _BUFFER_SECONDS:
-                self._move_best_to_archive(lost_cid)
-                del self._lost[lost_cid]
+    # ── Short-term ReID ───────────────────────────────────────────────────────
 
-    def _prune_id_map(self) -> None:
-        now = time.time()
-        if now - self._last_prune_time < 1.0:
-            return
-        self._last_prune_time = now
-        stale = [bt for bt, t in self._id_map_last_seen.items()
-                 if now - t > _ID_MAP_PRUNE_SECONDS]
-        for bt in stale:
-            self._id_map.pop(bt, None)
-            self._id_map_last_seen.pop(bt, None)
-
-    def _reid_lookup(self, embedding: np.ndarray) -> Optional[int]:
-        """Same-session lost-track re-association only (no gallery search)."""
-        if not self._lost:
+    def _reid_lookup(self, embedding: np.ndarray) -> Optional[Any]:
+        """Match against live embeddings in lost buffer."""
+        if not self._lost or embedding is None:
             return None
-        now = time.time()
-        valid_ids, valid_embs, ages = [], [], []
-        for lid, (emb, t_lost) in self._lost.items():
-            valid_ids.append(lid)
-            valid_embs.append(emb)
-            ages.append(now - t_lost)
-        mat   = np.stack(valid_embs, axis=0)
+        ids   = list(self._lost.keys())
+        embs  = [e.live_embedding for e in self._lost.values()]
+        mat   = np.stack(embs)
         norms = np.linalg.norm(mat, axis=1)
         eq    = np.linalg.norm(embedding)
-        sims  = np.zeros(len(valid_ids), dtype=np.float32)
+        sims  = np.zeros(len(ids), dtype=np.float32)
         mask  = (norms > 0) & (eq > 0)
         if mask.any():
             sims[mask] = (mat[mask] @ embedding) / (norms[mask] * eq)
-        best_idx  = int(np.argmax(sims))
-        threshold = (_REID_WITHIN_BUFFER_THRESHOLD
-                     if ages[best_idx] <= _BUFFER_SECONDS
-                     else _REID_CROSS_VISIT_THRESHOLD)
-        return valid_ids[best_idx] if sims[best_idx] >= threshold else None
+        best = int(np.argmax(sims))
+        return ids[best] if sims[best] > _REID_SIM else None
+
+    # ── Temp ID merge ─────────────────────────────────────────────────────────
+
+    def _try_merge_temp(self, real_id: int, cx: int, cy: int) -> None:
+        best_tmp, best_dist = None, float("inf")
+        for cid, state in self._active.items():
+            if not isinstance(cid, str) or not cid.startswith("tmp_"):
+                continue
+            dist = _centroid_dist(state.box, cx, cy)
+            if dist < _MERGE_PX and dist < best_dist:
+                best_dist, best_tmp = dist, cid
+        if best_tmp is None:
+            return
+
+        old          = self._active.pop(best_tmp)
+        old.track_id = real_id
+        self._active[real_id] = old
+
+        for bt, cid in list(self._id_map.items()):
+            if cid == best_tmp:
+                self._id_map[bt] = real_id
+
+        if best_tmp in self._img_path:
+            old_path = self._img_path.pop(best_tmp)
+            new_path = os.path.join(self._best_dir, f"id_{real_id}.jpg")
+            if os.path.exists(old_path):
+                self._write_pool.submit(_rename_worker, old_path, new_path)
+            self._img_path[real_id] = new_path
+
+        self._zones.transfer(best_tmp, real_id)
+        print(f"[IdentityManager] Merged tmp={best_tmp} → {real_id} ({best_dist:.0f}px)")
+
+    # ── Count person ──────────────────────────────────────────────────────────
+
+    def _count_person(self, cid: Any, state: PersonState, reason: str) -> None:
+        """Single entry point for all exit counting. Deduplication via gallery."""
+        if state.counted:
+            return
+        state.counted = True
+
+        img_path = self._img_path.get(cid, "")
+        best_emb = state.best_embedding
+        emb_norm = float(np.linalg.norm(best_emb))
+
+        if emb_norm < 0.1:
+            print(f"[Exit] WARNING cid={cid} reason={reason}: zero embedding — "
+                  "person may not have been in exit zone long enough.")
+
+        match_cid = self._gallery.find_match(best_emb, threshold=_SESSION_SIM)
+        if match_cid is not None:
+            self._gallery.upsert(match_cid, best_emb, image_path=img_path)
+            print(f"[Exit] {reason}: cid={cid} → matched {match_cid} — returning visitor")
+        else:
+            # session_gallery.cid is INTEGER PRIMARY KEY — convert tmp_ strings
+            gallery_cid = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
+            self._gallery.upsert(gallery_cid, best_emb, image_path=img_path)
+            self.unique_exit_count = self._gallery.total_unique()
+            print(f"[Exit] {reason}: NEW  cid={cid}  emb_norm={emb_norm:.3f}  "
+                  f"total={self.unique_exit_count}")
+
+        today_str = date.today().isoformat()
+        self._write_pool.submit(increment_zone_count, _EXIT_ZONE, today_str)
+
+    # ── Best frame: capture-and-replace (ONE file per person) ────────────────
+
+    def _update_best(self, cid: Any, conf: float, crop: np.ndarray,
+                     state: PersonState) -> None:
+        """
+        Write/overwrite output/best/id_<cid>.jpg only when conf improves.
+        Single file per person — same filename, replaced in-place.
+        Archive happens later (on lost-buffer expiry), never here.
+        Only called when person is inside the exit zone.
+        """
+        img_path = os.path.join(self._best_dir, f"id_{str(cid).replace('tmp_', 'tmp')}.jpg")
+        is_new   = cid not in self._img_path
+
+        stored_conf = 0.0 if is_new else state.best_conf
+        if is_new or conf >= stored_conf:
+            self._write_pool.submit(cv2.imwrite, img_path, crop.copy())
+            self._img_path[cid] = img_path
+            if self._gallery.contains(cid):
+                self._write_pool.submit(self._gallery.update_image_path, cid, img_path)
+
+    # ── Finalize on lost-buffer expiry ────────────────────────────────────────
+
+    def _finalize(self, cid: Any, entry: LostEntry) -> None:
+        """
+        Called ONLY when lost buffer expires (30 s no re-detection).
+        Archive image, run emotion analysis in background, write DB row.
+
+        SAFETY-NET: if person was in exit zone but never explicitly counted
+        (e.g. disappeared between frames mid-zone), count them now.
+        """
+        src = self._img_path.pop(cid, entry.image_path)
+
+        if not entry.counted:
+            if entry.was_in_exit_zone and src and os.path.exists(src):
+                print(f"[Exit] safety_net: cid={cid} — was in exit zone, counting on expiry")
+                match_cid = self._gallery.find_match(entry.best_embedding, threshold=_SESSION_SIM)
+                if match_cid is not None:
+                    self._gallery.upsert(match_cid, entry.best_embedding, image_path=src)
+                    print(f"[Exit] safety_net: cid={cid} matched {match_cid} — returning visitor")
+                else:
+                    gallery_cid = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
+                    self._gallery.upsert(gallery_cid, entry.best_embedding, image_path=src)
+                    self.unique_exit_count = self._gallery.total_unique()
+                    print(f"[Exit] safety_net: NEW  cid={cid}  total={self.unique_exit_count}")
+                today_str = date.today().isoformat()
+                self._write_pool.submit(increment_zone_count, _EXIT_ZONE, today_str)
+                # fall through to archive
+            else:
+                # Never in exit zone — discard image silently
+                if src and os.path.exists(src):
+                    self._write_pool.submit(_discard_worker, src)
+                return
+
+        if not src or not os.path.exists(src):
+            return
+
+        dst_dir = self._archive_dir(datetime.now())
+        safe    = str(cid).replace("tmp_", "tmp")
+        dst     = os.path.join(dst_dir, f"id_{safe}_conf_{entry.best_conf:.2f}.jpg")
+        self._write_pool.submit(
+            _archive_worker, src, dst, cid,
+            entry.best_conf, entry.first_seen, entry.last_seen,
+            entry.last_zone,
+        )
 
     # ── Main process loop ─────────────────────────────────────────────────────
 
     def process(self, frame: np.ndarray, raw_tracks: List[dict]) -> List[dict]:
-        self._expire_lost()
-        self._prune_id_map()
-
-        active_cids: set    = set()
-        results: List[dict] = []
+        frame_h     = frame.shape[0]
+        active_cids = set()
 
         for t in raw_tracks:
-            bt_id = t.get("track_id")
-
-            # Drop unconfirmed (negative synthetic) IDs from YoloDetector
-            if bt_id is None or bt_id <= 0:
-                continue
-
+            bt_id           = t["track_id"]
+            is_temp         = t.get("is_temp_id", False)
             x1, y1, x2, y2 = t["x1"], t["y1"], t["x2"], t["y2"]
-            conf            = float(t["conf"])
+            conf            = t["conf"]
             box             = (x1, y1, x2, y2)
+            cx, cy          = (x1 + x2) // 2, (y1 + y2) // 2
+            crop            = _crop_frame(frame, x1, y1, x2, y2)
 
-            crop = _crop(frame, x1, y1, x2, y2)
+            # ── Temp → real ID merge ──────────────────────────────────────────
+            if not is_temp and isinstance(bt_id, int) and bt_id not in self._id_map:
+                self._try_merge_temp(bt_id, cx, cy)
+                self._id_map[bt_id] = bt_id
 
-            self._id_map_last_seen[bt_id] = time.time()
+            cid = self._id_map.get(bt_id, bt_id)
 
-            # ── Resolve canonical ID (same-session re-ID only) ─────────────
-            if bt_id not in self._id_map:
-                emb_for_reid = _colour_hist(crop) if crop is not None else None
-                reclaimed    = self._reid_lookup(emb_for_reid) \
-                               if emb_for_reid is not None else None
-                self._id_map[bt_id] = reclaimed if reclaimed is not None else bt_id
-            cid = self._id_map[bt_id]
-
-            if cid in self._lost:
-                del self._lost[cid]
-
-            # ── Update / create PersonState ────────────────────────────────
+            # ── Embedding ─────────────────────────────────────────────────────
             prev_box = self._active[cid]._prev_box if cid in self._active else None
-            need_emb = _box_moved(prev_box, box, _HIST_SKIP_PX) and crop is not None
-            emb      = _colour_hist(crop) if need_emb else None
+            need_emb = (cid not in self._active) or _box_moved(prev_box, box, _HIST_SKIP_PX)
+            emb      = _spatial_embedding(crop, frame_h) if need_emb else None
 
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+            # ── ReID reclaim from lost buffer ─────────────────────────────────
+            reclaimed_entry: Optional[LostEntry] = None
+            if cid not in self._active and not is_temp and emb is not None:
+                reclaimed_cid = self._reid_lookup(emb)
+                if reclaimed_cid is not None:
+                    reclaimed_entry = self._lost.pop(reclaimed_cid)
+                    self._id_map[bt_id] = reclaimed_cid
+                    cid = reclaimed_cid
 
-            if cid in self._active:
-                self._active[cid].update((cx, cy), box, conf, emb)
-            else:
-                init_emb = (emb if emb is not None
-                            else (_colour_hist(crop) if crop is not None
-                                  else np.zeros(96, dtype=np.float32)))
+            # ── Zone update ───────────────────────────────────────────────────
+            self._zones.update(cid, (cx, cy))
+            current_zone = self._zones.current_zone(cid)
+            in_exit      = current_zone == _EXIT_ZONE
+
+            # ── Create or update PersonState ──────────────────────────────────
+            if cid not in self._active:
+                init_emb = emb if emb is not None else _spatial_embedding(crop, frame_h)
                 self._active[cid] = PersonState(cid, (cx, cy), box, conf, init_emb)
+                if reclaimed_entry is not None:
+                    self._active[cid].restore_from_lost(reclaimed_entry)
+                    if reclaimed_entry.image_path:
+                        self._img_path[cid] = reclaimed_entry.image_path
+                # First-frame zone flag
+                if in_exit:
+                    self._active[cid].was_in_exit_zone = True
+            else:
+                self._active[cid].update(
+                    (cx, cy), box, conf, emb, crop, frame_h, in_exit
+                )
 
+            state      = self._active[cid]
+            state.zone = current_zone
             active_cids.add(cid)
 
-            # ── Zone detection ─────────────────────────────────────────────
-            # Use foot-point (bottom-centre of bounding box)
-            foot_x = cx
-            foot_y = y2
-            current_zone = _current_zone(foot_x, foot_y)
-            self._active[cid].zone = current_zone
+            # ── Best frame: ONLY capture when inside exit zone ────────────────
+            # Mirrors entry-cam's in_capture guard exactly.
+            # Person's bounding-box crop is saved; full frame is never written.
+            if in_exit:
+                self._update_best(cid, conf, crop, state)
 
-            # Check dwell guard and count zone entries
-            triggered_zone = self._active[cid].update_zone_dwell(current_zone)
-            if triggered_zone is not None:
-                today_str = date.today().isoformat()
-                self._write_pool.submit(increment_zone_count, triggered_zone, today_str)
-                print(f"[ZONE] cid={cid} COUNTED in zone='{triggered_zone}' | {today_str}")
-
-            # ── Best-frame capture (zone-gated if CAPTURE_ZONES set) ───────
-            if crop is not None:
-                should_capture = (
-                    not _CAPTURE_ZONES                          # no restriction
-                    or current_zone in _CAPTURE_ZONES           # inside a capture zone
-                )
-                if should_capture:
-                    self._update_best(cid, conf, crop, current_zone)
-
-        # ── Gone persons → _lost ───────────────────────────────────────────
+        # ── Disappeared → lost buffer (no archive yet) ────────────────────────
         for gone_cid in set(self._active) - active_cids:
             s = self._active.pop(gone_cid)
-            self._lost[gone_cid] = (s.embedding, time.time())
 
-        # ── Build results ──────────────────────────────────────────────────
+            # Count: person was in exit zone at some point, now left the frame
+            if s.was_in_exit_zone and not s.counted:
+                self._count_person(gone_cid, s, "left_after_exit_zone")
+
+            img_path = self._img_path.get(gone_cid, "")
+            self._lost[gone_cid] = LostEntry(s, img_path, time.time())
+            self._zones.remove(gone_cid)
+
+        # ── Prune _id_map ──────────────────────────────────────────────────────
+        live_cids = set(self._active) | set(self._lost)
+        for bt_id in list(self._id_map):
+            if self._id_map[bt_id] not in live_cids:
+                del self._id_map[bt_id]
+
+        # ── Expire lost buffer → FINALIZE (archive + DB) ──────────────────────
+        now = time.time()
+        for lost_cid in list(self._lost):
+            entry = self._lost[lost_cid]
+            if now - entry.t_lost > _BUFFER_SECONDS:
+                self._finalize(lost_cid, entry)
+                del self._lost[lost_cid]
+
+        # ── Result list ────────────────────────────────────────────────────────
+        results = []
         for cid in active_cids:
             s = self._active[cid]
             results.append(dict(
-                track_id       = cid,
+                track_id          = cid,
                 x1=s.box[0], y1=s.box[1], x2=s.box[2], y2=s.box[3],
-                conf           = s.conf,
-                best_conf      = self._best_info.get(cid, {}).get("conf", s.conf),
-                centre         = s.centre_history[-1],
-                centre_history = s.centre_history,
-                zone           = s.zone,
-                counted_zones  = list(s.counted_zones),
-                first_seen     = s.first_seen,
-                last_seen      = s.last_seen,
+                conf              = s.conf,
+                best_conf         = s.best_conf,
+                centre            = s.centre_history[-1],
+                centre_history    = s.centre_history,
+                zone              = s.zone,
+                first_seen        = s.first_seen,
+                last_seen         = s.last_seen,
+                unique_exit_count = self.unique_exit_count,
             ))
-
         return results
-
-    # ── _update_best ──────────────────────────────────────────────────────────
-
-    def _update_best(self, cid: int, conf: float,
-                     crop: np.ndarray, zone: Optional[str] = None) -> None:
-        if crop is None or crop.size == 0:
-            if cid in self._best_info and cid in self._active:
-                self._best_info[cid]["last_seen"] = self._active[cid].last_seen
-            return
-
-        image_path = os.path.join(self._best_dir, f"id_{cid}.jpg")
-        is_new     = cid not in self._best_info
-        is_better  = not is_new and conf > self._best_info[cid]["conf"]
-
-        if not (is_new or is_better):
-            if cid in self._best_info and cid in self._active:
-                self._best_info[cid]["last_seen"] = self._active[cid].last_seen
-            return
-
-        s = self._active.get(cid)
-        first_seen = s.first_seen if s else time.time()
-        last_seen  = s.last_seen  if s else time.time()
-        crop_h     = crop.shape[0]
-
-        self._best_info[cid] = {
-            "conf"      : conf,
-            "first_seen": first_seen,
-            "last_seen" : last_seen,
-            "image_path": image_path,
-            "crop_h"    : crop_h,
-            "zone"      : zone,
-        }
-
-        gen = self._write_gen.get(cid, 0) + 1
-        self._write_gen[cid] = gen
-
-        self._write_pool.submit(
-            _write_best_worker,
-            image_path, crop.copy(), cid, conf,
-            first_seen, last_seen, crop_h, zone,
-            self._write_gen, gen,
-        )
-
-    # ── _move_best_to_archive ─────────────────────────────────────────────────
-
-    def _move_best_to_archive(self, cid: int) -> None:
-        if cid not in self._best_info:
-            self._write_gen.pop(cid, None)
-            return
-
-        info = self._best_info.pop(cid)
-        self._write_gen.pop(cid, None)
-        src  = info["image_path"]
-
-        # Wait up to 1 s for the async write to land
-        if not os.path.exists(src):
-            deadline = time.time() + 1.0
-            while not os.path.exists(src) and time.time() < deadline:
-                time.sleep(0.02)
-
-        if not os.path.exists(src):
-            print(f"[ARCHIVE] cid={cid} | ❌ FILE MISSING after 1s — no DB record.")
-            return
-
-        dst_dir = self._archive_dir(datetime.now())
-        dst     = os.path.join(dst_dir, f"id_{cid}_conf_{info['conf']:.2f}.jpg")
-
-        self._write_pool.submit(
-            _archive_worker,
-            src, dst, cid,
-            info["conf"],
-            info["first_seen"],
-            info["last_seen"],
-            info.get("crop_h", 0),
-            info.get("zone"),
-        )
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
-        print(f"[IDMGR] shutdown() | active={len(self._active)} | lost={len(self._lost)}")
-        for cid in list(self._active):
-            self._move_best_to_archive(cid)
-        self._active.clear()
-        for lost_cid in list(self._lost):
-            self._move_best_to_archive(lost_cid)
-        self._lost.clear()
+        for cid, s in list(self._active.items()):
+            img_path = self._img_path.get(cid, "")
+            entry    = LostEntry(s, img_path, time.time())
+            self._finalize(cid, entry)
+        for lost_cid, entry in list(self._lost.items()):
+            self._finalize(lost_cid, entry)
         self._write_pool.shutdown(wait=True)
-        print("[IDMGR] shutdown() complete — all tasks drained")
+        self._gallery.close()
         _db_close()
-
-    # ── Orphan recovery (identical to original) ───────────────────────────────
-
-    def _recover_live_buffer(self) -> None:
-        stale = get_all_live_buffer()
-        if not stale:
-            return
-        print(f"[IdentityManager] Recovering {len(stale)} orphaned image(s) from previous run…")
-        now = datetime.now()
-        for row in stale:
-            cid = row["cid"]
-            src = row["image_path"]
-            if not os.path.exists(src):
-                self._write_pool.submit(delete_live_buffer, cid)
-                continue
-            dst_dir = self._archive_dir(now)
-            dst = os.path.join(
-                dst_dir,
-                f"id_{cid}_conf_{row['best_conf']:.2f}_recovered.jpg",
-            )
-            self._write_pool.submit(
-                _archive_worker,
-                src, dst, cid,
-                row["best_conf"], row["first_seen"], row["last_seen"],
-                row.get("crop_h", 0),
-                row.get("zone"),
-            )
-        print("[IdentityManager] Recovery tasks submitted.")
-
-    # ── Public accessors ──────────────────────────────────────────────────────
-
-    def get_state(self) -> Dict[int, PersonState]:
-        return self._active
-
-    def active_count(self) -> int:
-        return len(self._active)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Background workers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _write_best_worker(
-    path: str,
-    crop: np.ndarray,
-    cid: int,
-    conf: float,
-    first_seen: float,
-    last_seen: float,
-    crop_h: int,
-    zone: Optional[str],
-    write_gen: dict,
-    gen_token: int,
-) -> None:
-    if write_gen.get(cid, 0) != gen_token:
-        return   # stale write — a newer crop superseded this one
-    ok = cv2.imwrite(path, crop)
-    if ok:
-        upsert_live_buffer(cid, path, conf, first_seen, last_seen, crop_h, zone)
-
-
-def _archive_worker(
-    src: str,
-    dst: str,
-    track_id: int,
-    best_conf: float,
-    first_seen: float,
-    last_seen: float,
-    crop_h: int = 0,
-    zone: Optional[str] = None,
-) -> None:
+def _rename_worker(src: str, dst: str) -> None:
     try:
         os.rename(src, dst)
     except OSError:
@@ -614,7 +644,27 @@ def _archive_worker(
         except OSError:
             pass
 
-    emotion, emotion_score = _analyse_emotion(dst, crop_h)
+
+def _discard_worker(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _archive_worker(src: str, dst: str, track_id: Any,
+                    best_conf: float, first_seen: float, last_seen: float,
+                    zone: Optional[str] = None) -> None:
+    try:
+        os.rename(src, dst)
+    except OSError:
+        try:
+            shutil.copy2(src, dst)
+            os.remove(src)
+        except OSError:
+            pass
+
+    emotion, emotion_score = _analyse_emotion(dst)
 
     save_person_metadata(
         track_id      = track_id,
@@ -627,6 +677,23 @@ def _archive_worker(
         zone          = zone,
     )
 
-    delete_live_buffer(track_id)
-    print(f"[ARCHIVE_WORKER] track_id={track_id} | zone={zone} | "
-          f"emotion={emotion} ({emotion_score}) | ✅ archived")
+    # Forward to backend WS (non-blocking — dashboard registers this callback)
+    if _on_archived is not None:
+        try:
+            img_b64 = None
+            try:
+                with open(dst, "rb") as _f:
+                    img_b64 = base64.b64encode(_f.read()).decode()
+            except Exception:
+                pass
+            _on_archived({
+                "event":         "archived",
+                "track_id":      track_id,
+                "emotion":       emotion,
+                "emotion_score": round(float(emotion_score), 3) if emotion_score is not None else None,
+                "zone":          zone,
+                "image":         img_b64,
+                "ts":            time.time(),
+            })
+        except Exception:
+            pass

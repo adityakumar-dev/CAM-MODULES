@@ -1,43 +1,9 @@
-"""
-manager/dashboard.py  —  Entry-Cam Dashboard Server
-=====================================================
-
-Bug fixed: image_path in session gallery was stored as a relative path
-("output/best/id_N.jpg") but gallery_session() was calling
-os.path.relpath(relative, absolute_base) which produces broken paths like
-"../../../output/best/id_N.jpg".
-
-Fix: normalise image_path to always be a web-accessible URL fragment
-starting with "output/" regardless of how it was stored (absolute or relative).
-
-FIX-E (identity_manager.py sync): notify() signature restored to
-    notify(tracks: list[dict], identity_manager)
-  The previous version changed it to notify(snapshot: dict) which broke
-  the dashboard because this file was never updated to match.
-
-WebSocket events
-----------------
-  heartbeat   { active_count, unique_count, ts }
-  enter       { track_id, conf, zone, ts }
-  exit        { track_id, dwell, ts, refresh_recent }
-  new_entry   { unique_count, ts }
-
-REST
-----
-  GET /api/stream           MJPEG live feed
-  GET /api/stats/session    { unique_total, today_count, active_now }
-  GET /api/stats/hourly     [{ hour, count }] today from session gallery
-  GET /api/recent           last 20 archived persons from metadata.db
-  GET /api/gallery/session  all session-gallery persons + fixed image URLs
-  GET /api/gallery/flat     all output/best/*.jpg (live buffer)
-  GET /api/gallery/days     archive tree by day/hour
-  GET /output/...           static file serving
-  GET /                     dashboard UI
-"""
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
+import json
 import os
 import sqlite3
 import threading
@@ -52,6 +18,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 
 import config
+
+# ── Backend WS config — read from config.py ───────────────────────────────────
+BACKEND_WS_URL    = getattr(config, "BACKEND_WS_URL",    "")
+BACKEND_WS_TOKEN  = getattr(config, "BACKEND_WS_TOKEN",  "changeme")
+BACKEND_CAM_ID    = getattr(config, "BACKEND_CAM_ID",    "entry-cam")
+BACKEND_FRAME_FPS = float(getattr(config, "BACKEND_FRAME_FPS", 1))
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,6 +43,9 @@ app.mount("/output", StaticFiles(directory=_OUTPUT_DIR), name="output")
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
+
+
+
 # ── Image path normalisation ───────────────────────────────────────────────────
 def _web_path(raw: str) -> str:
     """
@@ -78,10 +53,10 @@ def _web_path(raw: str) -> str:
     starting with "output/".
 
     Handles:
-      ""                              -> ""
-      "output/best/id_5.jpg"          -> "output/best/id_5.jpg"
-      "/abs/path/output/best/id_5.jpg"-> "output/best/id_5.jpg"
-      "../../../output/best/id_5.jpg" -> ""
+      ""                               -> ""
+      "output/best/id_5.jpg"           -> "output/best/id_5.jpg"
+      "/abs/path/output/best/id_5.jpg" -> "output/best/id_5.jpg"
+      "../../../output/best/id_5.jpg"  -> ""   (path-traversal guard)
     """
     if not raw:
         return ""
@@ -98,11 +73,14 @@ _frame_lock = threading.Lock()
 
 
 def push_frame(frame) -> None:
+    """Encode a raw OpenCV frame, cache it for MJPEG streaming, and forward to backend WS."""
     global _latest_frame
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
     if ok:
+        frame_bytes = buf.tobytes()
         with _frame_lock:
-            _latest_frame = buf.tobytes()
+            _latest_frame = frame_bytes
+        _backend_enqueue_frame(frame_bytes)
 
 
 def _mjpeg_gen():
@@ -124,17 +102,122 @@ async def stream():
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 _ws_clients: list[WebSocket] = []
-_ws_lock = threading.Lock()
+_ws_lock    = threading.Lock()
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+# ── Outbound backend WebSocket client ─────────────────────────────────────────
+_backend_event_q: Optional[asyncio.Queue] = None
+_backend_frame_q: Optional[asyncio.Queue] = None
+
+
+async def _backend_ws_loop() -> None:
+    """
+    Persistent outbound WebSocket client.
+    - Connects to BACKEND_WS_URL with Bearer token auth.
+    - Drains _backend_event_q and _backend_frame_q and sends them.
+    - Reconnects automatically with exponential backoff on any error.
+    - Runs entirely inside the uvicorn event loop — never blocks the pipeline.
+    """
+    import websockets
+
+    backoff = 1.0
+    attempt = 0
+    headers = {"Authorization": f"Bearer {BACKEND_WS_TOKEN}"}
+
+    while True:
+        attempt += 1
+        try:
+            async with websockets.connect(
+                BACKEND_WS_URL,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                if attempt > 1:
+                    print(f"[Backend WS] reconnected (attempt {attempt}) → {BACKEND_WS_URL}")
+                else:
+                    print(f"[Backend WS] connected → {BACKEND_WS_URL}")
+                backoff = 1.0
+                attempt = 0
+
+                while True:
+                    try:
+                        payload = _backend_event_q.get_nowait()
+                        await ws.send(json.dumps(payload))
+                        _backend_event_q.task_done()
+                        continue
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    try:
+                        frame_b64 = _backend_frame_q.get_nowait()
+                        await ws.send(json.dumps({
+                            "type":  "frame",
+                            "cam":   BACKEND_CAM_ID,
+                            "image": frame_b64,
+                            "ts":    time.time(),
+                        }))
+                        _backend_frame_q.task_done()
+                        continue
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    await asyncio.sleep(0.05)
+
+        except Exception as exc:
+            print(f"[Backend WS] disconnected — {exc} | retry in {backoff:.0f}s (attempt {attempt})")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+def _backend_enqueue_event(payload: dict) -> None:
+    if not _event_loop or not _backend_event_q or not BACKEND_WS_URL:
+        return
+    asyncio.run_coroutine_threadsafe(
+        _backend_event_q.put(payload), _event_loop
+    )
+
+
+_backend_last_frame_t: float = 0.0
+
+
+def _backend_enqueue_frame(frame_bytes: bytes) -> None:
+    global _backend_last_frame_t
+    if not _event_loop or not _backend_frame_q or not BACKEND_WS_URL:
+        return
+    if BACKEND_FRAME_FPS <= 0:
+        return
+    now = time.time()
+    if now - _backend_last_frame_t < 1.0 / BACKEND_FRAME_FPS:
+        return
+    _backend_last_frame_t = now
+    b64 = base64.b64encode(frame_bytes).decode()
+    try:
+        _backend_frame_q.get_nowait()
+        _backend_frame_q.task_done()
+    except asyncio.QueueEmpty:
+        pass
+    asyncio.run_coroutine_threadsafe(
+        _backend_frame_q.put(b64), _event_loop
+    )
 
 
 @app.on_event("startup")
 async def _grab_loop():
-    global _event_loop
-    _event_loop = asyncio.get_running_loop()
+    global _event_loop, _backend_event_q, _backend_frame_q
+    _event_loop       = asyncio.get_running_loop()
+    _backend_event_q  = asyncio.Queue(maxsize=256)
+    _backend_frame_q  = asyncio.Queue(maxsize=1)
+    if BACKEND_WS_URL:
+        asyncio.create_task(_backend_ws_loop())
+        print(f"[Backend WS] client configured → {BACKEND_WS_URL} (cam={BACKEND_CAM_ID})")
+    else:
+        print("[Backend WS] disabled (BACKEND_WS_URL not set)")
 
 
 def _broadcast(payload: dict) -> None:
+    """Send a JSON payload to all connected WebSocket clients."""
     if not _event_loop:
         return
     with _ws_lock:
@@ -153,6 +236,12 @@ def _broadcast(payload: dict) -> None:
             for ws in dead:
                 if ws in _ws_clients:
                     _ws_clients.remove(ws)
+
+
+def _emit(payload: dict) -> None:
+    """Broadcast to local WebSocket clients AND forward to backend WS."""
+    _broadcast(payload)
+    _backend_enqueue_event({"type": "event", "cam": BACKEND_CAM_ID, "data": payload})
 
 
 @app.websocket("/ws")
@@ -174,10 +263,10 @@ def _q_archive(sql: str, params: tuple = ()) -> list[dict]:
     if not os.path.exists(_ARCHIVE_DB):
         return []
     try:
-        c = sqlite3.connect(_ARCHIVE_DB)
-        c.row_factory = sqlite3.Row
-        rows = c.execute(sql, params).fetchall()
-        c.close()
+        con = sqlite3.connect(_ARCHIVE_DB)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+        con.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -187,10 +276,10 @@ def _q_session(sql: str, params: tuple = ()) -> list[dict]:
     if not os.path.exists(_SESSION_DB):
         return []
     try:
-        c = sqlite3.connect(_SESSION_DB)
-        c.row_factory = sqlite3.Row
-        rows = c.execute(sql, params).fetchall()
-        c.close()
+        con = sqlite3.connect(_SESSION_DB)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+        con.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -205,8 +294,10 @@ def _today_epoch() -> float:
 @app.get("/")
 async def index():
     p = os.path.join(_STATIC_DIR, "index.html")
-    return FileResponse(p) if os.path.exists(p) else JSONResponse(
-        {"error": "index.html missing"}, status_code=404
+    return (
+        FileResponse(p)
+        if os.path.exists(p)
+        else JSONResponse({"error": "index.html missing"}, status_code=404)
     )
 
 
@@ -226,23 +317,32 @@ async def stats_session():
 
 @app.get("/api/stats/hourly")
 async def stats_hourly():
-    return _q_session("""
-        SELECT CAST(strftime('%H', datetime(first_entry,'unixepoch','localtime'))
-                    AS INTEGER) AS hour,
+    return _q_session(
+        """
+        SELECT CAST(
+                   strftime('%H', datetime(first_entry, 'unixepoch', 'localtime'))
+               AS INTEGER) AS hour,
                COUNT(*) AS count
-        FROM session_gallery
-        WHERE first_entry >= ?
-        GROUP BY hour ORDER BY hour
-    """, (_today_epoch(),))
+        FROM   session_gallery
+        WHERE  first_entry >= ?
+        GROUP  BY hour
+        ORDER  BY hour
+        """,
+        (_today_epoch(),),
+    )
 
 
 @app.get("/api/recent")
 async def recent():
-    rows = _q_archive("""
+    rows = _q_archive(
+        """
         SELECT track_id, best_conf, first_seen, last_seen,
                ROUND(last_seen - first_seen, 1) AS dwell, image_path
-        FROM person ORDER BY id DESC LIMIT 20
-    """)
+        FROM   person
+        ORDER  BY id DESC
+        LIMIT  20
+        """
+    )
     for r in rows:
         r["image_path"] = _web_path(r.get("image_path", ""))
     return rows
@@ -250,10 +350,13 @@ async def recent():
 
 @app.get("/api/gallery/session")
 async def gallery_session():
-    rows = _q_session("""
+    rows = _q_session(
+        """
         SELECT cid, entry_count, first_entry, last_seen, image_path
-        FROM session_gallery ORDER BY last_seen DESC
-    """)
+        FROM   session_gallery
+        ORDER  BY last_seen DESC
+        """
+    )
     for r in rows:
         r["image_path"] = _web_path(r.get("image_path", ""))
     return rows
@@ -275,71 +378,84 @@ async def gallery_flat():
 async def gallery_days():
     if not os.path.exists(_BEST_DIR):
         return []
-    result = []
+    result   = []
     day_dirs = sorted(
-        [d for d in os.listdir(_BEST_DIR)
-         if os.path.isdir(os.path.join(_BEST_DIR, d)) and d.startswith("day_")],
+        [
+            d for d in os.listdir(_BEST_DIR)
+            if os.path.isdir(os.path.join(_BEST_DIR, d)) and d.startswith("day_")
+        ],
         reverse=True,
     )
     for day in day_dirs:
-        dp = os.path.join(_BEST_DIR, day)
+        dp    = os.path.join(_BEST_DIR, day)
         hours = []
         for hour in sorted(
-            [h for h in os.listdir(dp)
-             if os.path.isdir(os.path.join(dp, h)) and h.startswith("hour_")],
+            [
+                h for h in os.listdir(dp)
+                if os.path.isdir(os.path.join(dp, h)) and h.startswith("hour_")
+            ],
             reverse=True,
         ):
-            hp = os.path.join(dp, hour)
+            hp     = os.path.join(dp, hour)
             images = sorted(
                 [f for f in os.listdir(hp) if f.endswith(".jpg")],
                 key=lambda f: os.path.getmtime(os.path.join(hp, f)),
                 reverse=True,
             )
-            hours.append({
-                "hour":   hour,
-                "images": [
-                    {"path": f"output/best/{day}/{hour}/{f}", "name": f}
-                    for f in images
-                ],
-            })
+            hours.append(
+                {
+                    "hour":   hour,
+                    "images": [
+                        {"path": f"output/best/{day}/{hour}/{f}", "name": f}
+                        for f in images
+                    ],
+                }
+            )
         result.append({"day": day, "hours": hours})
     return result
 
 
-# ── Pipeline hooks ─────────────────────────────────────────────────────────────
-_prev_ids:   set        = set()
-_seen_cache: dict       = {}
-_active_ref: list[int]  = [0]
-_last_hb:    float      = 0.0
-_state:      dict       = {}
-_TWO_HOURS              = 7200
+# ── Pipeline state ─────────────────────────────────────────────────────────────
+_prev_ids:   set       = set()
+_seen_cache: dict      = {}          # track_id -> first_seen timestamp
+_active_ref: list[int] = [0]         # mutable int so REST can read it
+_last_hb:    float     = 0.0
+_state:      dict      = {}
+_TWO_HOURS             = 7200
 
 
+# ── Pipeline hook ──────────────────────────────────────────────────────────────
 def notify(tracks: list[dict], identity_manager) -> None:
     """
-    FIX-E: signature is (tracks, identity_manager) — unchanged from original.
-    The broken intermediate version passed a snapshot dict which caused
-    AttributeError on identity_manager.get_state() and .unique_entry_count.
+    Called every pipeline tick with the current list of active tracks.
+
+    Emits the following events to both local WebSocket clients and the VPS:
+      - enter        : a new track_id appeared in the frame
+      - exit         : a track_id left the frame (includes dwell time)
+      - new_entry    : the global unique-visitor count incremented
+      - heartbeat    : sent at most once per second with live counts
     """
     global _prev_ids, _last_hb, _seen_cache
+
     now         = time.time()
     current_ids = {t["track_id"] for t in tracks}
     _active_ref[0] = len(current_ids)
 
-    # Purge stale seen cache
-    for tid in [k for k, v in _seen_cache.items() if now - v > _TWO_HOURS]:
+    # ── Purge stale seen-cache entries (older than 2 hours) ────────────────────
+    stale = [k for k, v in _seen_cache.items() if now - v > _TWO_HOURS]
+    for tid in stale:
         del _seen_cache[tid]
 
-    # Cache first_seen from identity_manager state
+    # ── Populate seen-cache from identity_manager state ────────────────────────
     for tid, state in identity_manager.get_state().items():
         if tid not in _seen_cache:
             _seen_cache[tid] = state.first_seen
 
-    # Enter events
+    # ── Enter events ───────────────────────────────────────────────────────────
     for tid in current_ids - _prev_ids:
         t = next((x for x in tracks if x["track_id"] == tid), None)
         if t:
-            _broadcast({
+            _emit({
                 "event":    "enter",
                 "track_id": tid,
                 "conf":     round(t.get("conf", 0), 3),
@@ -347,10 +463,10 @@ def notify(tracks: list[dict], identity_manager) -> None:
                 "ts":       now,
             })
 
-    # Exit events
+    # ── Exit events ────────────────────────────────────────────────────────────
     for tid in _prev_ids - current_ids:
         first = _seen_cache.pop(tid, None)
-        _broadcast({
+        _emit({
             "event":          "exit",
             "track_id":       tid,
             "dwell":          round(now - first, 1) if first else 0.0,
@@ -358,17 +474,17 @@ def notify(tracks: list[dict], identity_manager) -> None:
             "refresh_recent": True,
         })
 
-    # New unique entry event
+    # ── New unique-entry event ─────────────────────────────────────────────────
     unique = identity_manager.unique_entry_count
     if unique != _state.get("last_unique", unique):
-        _broadcast({"event": "new_entry", "unique_count": unique, "ts": now})
+        _emit({"event": "new_entry", "unique_count": unique, "ts": now})
     _state["last_unique"] = unique
 
     _prev_ids = current_ids
 
-    # Heartbeat every 1 s
+    # ── Heartbeat (max 1 per second) ───────────────────────────────────────────
     if now - _last_hb >= 1.0:
-        _broadcast({
+        _emit({
             "event":        "heartbeat",
             "active_count": len(current_ids),
             "unique_count": unique,
@@ -377,8 +493,21 @@ def notify(tracks: list[dict], identity_manager) -> None:
         _last_hb = now
 
 
-def start(host: str = "0.0.0.0", port: int = 8000) -> None:
+# ── Server entrypoint ──────────────────────────────────────────────────────────
+def start(host: str = "0.0.0.0", port: int = 8002) -> None:
+    # Wire up callbacks so background archive threads can forward events
+    # to the backend WS (they run outside asyncio).
+    from . import identity_manager as _im_mod
+    _im_mod._on_captured = lambda ev: _backend_enqueue_event(
+        {"type": "event", "cam": BACKEND_CAM_ID, "data": ev}
+    )
+    _im_mod._on_reentry = lambda cid, visit_count: _backend_enqueue_event(
+        {"type": "event", "cam": BACKEND_CAM_ID, "data": {
+            "event": "reentry", "cid": cid, "visit_count": visit_count, "ts": time.time()
+        }}
+    )
+
     cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    s   = uvicorn.Server(cfg)
-    threading.Thread(target=s.run, daemon=True).start()
+    srv = uvicorn.Server(cfg)
+    threading.Thread(target=srv.run, daemon=True).start()
     print(f"[Dashboard] http://localhost:{port}")

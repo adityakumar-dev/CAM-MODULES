@@ -1,36 +1,35 @@
 """
-manager/dashboard.py
-====================
-FastAPI server — runs in a background daemon thread inside main.py.
-
-WebSocket  ws://localhost:8000/ws
-    {"event": "heartbeat",  "active_count": N, "ts": epoch}
-    {"event": "enter",      "track_id": N, "conf": 0.xx, "ts": epoch}
+manager/dashboard.py  —  Exit-Cam Dashboard
+=============================================
+WebSocket  ws://localhost:8001/ws
+    {"event": "heartbeat",  "active_count": N, "unique_count": N, "ts": epoch}
+    {"event": "enter",      "track_id": N, "conf": 0.xx, "zone": "...", "ts": epoch}
     {"event": "exit",       "track_id": N, "dwell": N.N, "ts": epoch, "refresh_recent": true}
+    {"event": "new_entry",  "unique_count": N, "ts": epoch}
 
 REST
     GET /api/stream              → MJPEG live frame stream
-    GET /api/stats/today         → total, avg_dwell, avg_conf
+    GET /api/stats/session       → unique_total, today_count, active_now
     GET /api/stats/hourly        → [{hour, count}] for today
     GET /api/stats/emotions      → [{emotion, count}]
     GET /api/recent              → last 20 archived persons (with image paths)
     GET /api/gallery/flat        → all images in output/best/ (live buffer)
     GET /api/gallery/days        → tree: [{day, hours: [{hour, images:[]}]}]
+    GET /api/gallery/session     → session gallery ordered by last_seen DESC
     GET /output/...              → static file serving for archived images
     GET /                        → dashboard UI
 """
 from __future__ import annotations
 
 import asyncio
-import glob
+import base64
+import datetime
+import json
 import os
-import re
 import sqlite3
 import threading
 import time
 from typing import Optional
-
-import config
 
 import cv2
 import uvicorn
@@ -39,88 +38,210 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 
-# ── paths ──────────────────────────────────────────────────────────────────────
+import config
+
+# ── Backend WS config — read from config.py ───────────────────────────────────
+BACKEND_WS_URL    = getattr(config, "BACKEND_WS_URL",    "")
+BACKEND_WS_TOKEN  = getattr(config, "BACKEND_WS_TOKEN",  "changeme")
+BACKEND_CAM_ID    = getattr(config, "BACKEND_CAM_ID",    "exit-cam")
+BACKEND_FRAME_FPS = float(getattr(config, "BACKEND_FRAME_FPS", 1))
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
 _BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _OUTPUT_DIR = os.path.join(_BASE_DIR, "output")
 _STATIC_DIR = os.path.join(_BASE_DIR, "static")
-_BEST_DIR   = os.path.join(_BASE_DIR, "output", "best")
+_BEST_DIR   = os.path.join(_OUTPUT_DIR, "best")
+_ARCHIVE_DB = os.path.join(_OUTPUT_DIR, "metadata.db")
+_SESSION_DB = os.path.join(_OUTPUT_DIR, "exit_session.db")
 
-
-def _get_db_path() -> Optional[str]:
-    for p in [
-        os.path.join(_BASE_DIR, "metadata.db"),
-        os.path.join(_BEST_DIR, "metadata.db"),
-    ]:
-        if os.path.exists(p):
-            return p
-    return None
-
-
-# ── FastAPI ────────────────────────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Exit-Cam Dashboard")
 
-os.makedirs(_STATIC_DIR, exist_ok=True)
-os.makedirs(_OUTPUT_DIR, exist_ok=True)
+for _d in (_STATIC_DIR, _OUTPUT_DIR, _BEST_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 app.mount("/output", StaticFiles(directory=_OUTPUT_DIR), name="output")
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
-# ── MJPEG live stream ──────────────────────────────────────────────────────────
-# latest_frame is set by push_frame() called from main.py pipeline
+
+
+
+# ── Image path normalisation ───────────────────────────────────────────────────
+def _web_path(raw: str) -> str:
+    """Convert an absolute filesystem path to a web-servable relative path."""
+    if not raw:
+        return ""
+    p   = raw.replace("\\", "/")
+    idx = p.find("output/")
+    if idx >= 0:
+        return p[idx:]
+    return ""
+
+
+# ── MJPEG stream ───────────────────────────────────────────────────────────────
 _latest_frame: Optional[bytes] = None
 _frame_lock = threading.Lock()
 
 
 def push_frame(frame) -> None:
-    """Call from pipeline() with the annotated BGR frame."""
+    """Encode a BGR frame, cache it for MJPEG streaming, and forward to backend WS."""
     global _latest_frame
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
     if ok:
+        frame_bytes = buf.tobytes()
         with _frame_lock:
-            _latest_frame = buf.tobytes()
+            _latest_frame = frame_bytes
+        _backend_enqueue_frame(frame_bytes)
 
 
-def _mjpeg_generator():
+def _mjpeg_gen():
     while True:
         with _frame_lock:
-            frame = _latest_frame
-        if frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            )
-        time.sleep(0.04)   # ~25 fps cap
+            f = _latest_frame
+        if f:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + f + b"\r\n"
+        time.sleep(0.033)
 
 
 @app.get("/api/stream")
 async def stream():
     return StreamingResponse(
-        _mjpeg_generator(),
+        _mjpeg_gen(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 _ws_clients: list[WebSocket] = []
-_ws_lock = threading.Lock()
+_ws_lock    = threading.Lock()
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+# ── Outbound backend WebSocket client ─────────────────────────────────────────
+# Queues — asyncio.Queue is safe to put() from threads via run_coroutine_threadsafe
+_backend_event_q: Optional[asyncio.Queue] = None   # JSON-serialisable dicts
+_backend_frame_q: Optional[asyncio.Queue] = None   # raw JPEG bytes
+
+
+async def _backend_ws_loop() -> None:
+    """
+    Persistent outbound WebSocket client.
+    - Connects to BACKEND_WS_URL with Bearer token auth.
+    - Drains _backend_event_q and _backend_frame_q and sends them.
+    - Reconnects automatically with exponential backoff on any error.
+    - Runs entirely inside the uvicorn event loop — never blocks the pipeline.
+    """
+    import websockets  # optional dep; only imported when URL is configured
+
+    backoff  = 1.0
+    attempt  = 0
+    headers  = {"Authorization": f"Bearer {BACKEND_WS_TOKEN}"}
+
+    while True:
+        attempt += 1
+        try:
+            async with websockets.connect(
+                BACKEND_WS_URL,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                if attempt > 1:
+                    print(f"[Backend WS] reconnected (attempt {attempt}) → {BACKEND_WS_URL}")
+                else:
+                    print(f"[Backend WS] connected → {BACKEND_WS_URL}")
+                backoff = 1.0  # reset on successful connect
+                attempt = 0
+
+                while True:
+                    # Drain both queues, prioritising events over frames
+                    try:
+                        payload = _backend_event_q.get_nowait()
+                        await ws.send(json.dumps(payload))
+                        _backend_event_q.task_done()
+                        continue
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    try:
+                        frame_b64 = _backend_frame_q.get_nowait()
+                        await ws.send(json.dumps({
+                            "type":   "frame",
+                            "cam":    BACKEND_CAM_ID,
+                            "image":  frame_b64,
+                            "ts":     time.time(),
+                        }))
+                        _backend_frame_q.task_done()
+                        continue
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    # Nothing queued — yield briefly
+                    await asyncio.sleep(0.05)
+
+        except Exception as exc:
+            print(f"[Backend WS] disconnected — {exc} | retry in {backoff:.0f}s (attempt {attempt})")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+def _backend_enqueue_event(payload: dict) -> None:
+    """Thread-safe: put an event dict onto the backend event queue."""
+    if not _event_loop or not _backend_event_q or not BACKEND_WS_URL:
+        return
+    asyncio.run_coroutine_threadsafe(
+        _backend_event_q.put(payload), _event_loop
+    )
+
+
+# Frame throttle state
+_backend_last_frame_t: float = 0.0
+
+
+def _backend_enqueue_frame(frame_bytes: bytes) -> None:
+    """Thread-safe: enqueue a JPEG frame for backend forwarding (throttled)."""
+    global _backend_last_frame_t
+    if not _event_loop or not _backend_frame_q or not BACKEND_WS_URL:
+        return
+    if BACKEND_FRAME_FPS <= 0:
+        return
+    now = time.time()
+    if now - _backend_last_frame_t < 1.0 / BACKEND_FRAME_FPS:
+        return
+    _backend_last_frame_t = now
+    b64 = base64.b64encode(frame_bytes).decode()
+    # maxsize=1 queue: drop old frame if backend is slow (always send latest)
+    try:
+        _backend_frame_q.get_nowait()  # discard stale frame
+        _backend_frame_q.task_done()
+    except asyncio.QueueEmpty:
+        pass
+    asyncio.run_coroutine_threadsafe(
+        _backend_frame_q.put(b64), _event_loop
+    )
 
 
 @app.on_event("startup")
 async def _grab_loop():
-    global _event_loop
-    _event_loop = asyncio.get_running_loop()
+    global _event_loop, _backend_event_q, _backend_frame_q
+    _event_loop       = asyncio.get_running_loop()
+    _backend_event_q  = asyncio.Queue(maxsize=256)
+    _backend_frame_q  = asyncio.Queue(maxsize=1)
+    if BACKEND_WS_URL:
+        asyncio.create_task(_backend_ws_loop())
+        print(f"[Backend WS] client configured → {BACKEND_WS_URL} (cam={BACKEND_CAM_ID})")
+    else:
+        print("[Backend WS] disabled (BACKEND_WS_URL not set)")
 
 
-def _broadcast(payload: dict):
-    if _event_loop is None:
+def _broadcast(payload: dict) -> None:
+    if not _event_loop:
         return
     with _ws_lock:
         clients = list(_ws_clients)
     dead = []
     for ws in clients:
-        # Skip sockets already known to be disconnected
         if ws.client_state != WebSocketState.CONNECTED:
             dead.append(ws)
             continue
@@ -128,12 +249,17 @@ def _broadcast(payload: dict):
             asyncio.run_coroutine_threadsafe(ws.send_json(payload), _event_loop)
         except Exception:
             dead.append(ws)
-    # Clean up dead connections so the list doesn't grow over days
     if dead:
         with _ws_lock:
             for ws in dead:
                 if ws in _ws_clients:
                     _ws_clients.remove(ws)
+
+
+def _emit(payload: dict) -> None:
+    """Broadcast to local WebSocket clients AND forward to backend WS."""
+    _broadcast(payload)
+    _backend_enqueue_event({"type": "event", "cam": BACKEND_CAM_ID, "data": payload})
 
 
 @app.websocket("/ws")
@@ -150,89 +276,139 @@ async def ws_endpoint(ws: WebSocket):
                 _ws_clients.remove(ws)
 
 
-# ── DB ─────────────────────────────────────────────────────────────────────────
-def _query(sql: str, params: tuple = ()) -> list[dict]:
-    db = _get_db_path()
-    if not db:
+# ── DB helpers ─────────────────────────────────────────────────────────────────
+def _q_archive(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a read-only query against the archive metadata DB."""
+    if not os.path.exists(_ARCHIVE_DB):
         return []
     try:
-        conn = sqlite3.connect(db)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
+        con = sqlite3.connect(_ARCHIVE_DB)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+        con.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
 
 
-# ── REST ───────────────────────────────────────────────────────────────────────
+def _q_session(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a read-only query against the session gallery DB."""
+    if not os.path.exists(_SESSION_DB):
+        return []
+    try:
+        con = sqlite3.connect(_SESSION_DB)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _today_epoch() -> float:
+    """Return Unix timestamp for the start of today (midnight local time)."""
+    d = datetime.date.today()
+    return float(int(datetime.datetime(d.year, d.month, d.day).timestamp()))
+
+
+# ── REST endpoints ─────────────────────────────────────────────────────────────
 @app.get("/")
 async def index():
     p = os.path.join(_STATIC_DIR, "index.html")
-    return FileResponse(p) if os.path.exists(p) else JSONResponse(
-        {"error": "index.html missing from static/"}, status_code=404)
+    return (
+        FileResponse(p)
+        if os.path.exists(p)
+        else JSONResponse({"error": "index.html missing"}, status_code=404)
+    )
 
 
-@app.get("/api/config")
-async def api_config():
-    """Expose pipeline tuning values the frontend needs (read-only)."""
+@app.get("/api/stats/session")
+async def stats_session():
+    """Total unique exits (all-time), today's count, and currently active count."""
+    total = _q_session("SELECT COUNT(*) AS n FROM session_gallery")
+    today = _q_session(
+        "SELECT COUNT(*) AS n FROM session_gallery WHERE first_exit >= ?",
+        (_today_epoch(),),
+    )
     return {
-        "reid_buffer_seconds": getattr(config, "REID_BUFFER_SECONDS",
-                                        getattr(config, "REID_BUFFER_FRAMES", 90) / 30),
+        "unique_total": total[0]["n"] if total else 0,
+        "today_count":  today[0]["n"] if today  else 0,
+        "active_now":   _active_ref[0],
     }
-
-
-@app.get("/api/stats/today")
-async def stats_today():
-    rows = _query("""
-        SELECT COUNT(*) AS total,
-               ROUND(AVG(last_seen - first_seen), 2) AS avg_dwell,
-               ROUND(AVG(best_conf), 3) AS avg_conf
-        FROM person
-        WHERE first_seen >= strftime('%s','now','start of day')
-    """)
-    return rows[0] if rows else {"total": 0, "avg_dwell": 0, "avg_conf": 0}
 
 
 @app.get("/api/stats/hourly")
 async def stats_hourly():
-    return _query("""
-        SELECT CAST(strftime('%H', datetime(first_seen,'unixepoch','localtime'))
-                    AS INTEGER) AS hour,
+    """Exit counts per hour for today (from session gallery)."""
+    return _q_session(
+        """
+        SELECT CAST(
+                   strftime('%H', datetime(first_exit, 'unixepoch', 'localtime'))
+               AS INTEGER) AS hour,
                COUNT(*) AS count
-        FROM person
-        WHERE first_seen >= strftime('%s','now','start of day')
-        GROUP BY hour ORDER BY hour
-    """)
+        FROM   session_gallery
+        WHERE  first_exit >= ?
+        GROUP  BY hour
+        ORDER  BY hour
+        """,
+        (_today_epoch(),),
+    )
 
 
 @app.get("/api/stats/emotions")
 async def stats_emotions():
-    return _query("""
-        SELECT COALESCE(emotion,'Undetected') AS emotion, COUNT(*) AS count
-        FROM person GROUP BY emotion ORDER BY count DESC
-    """)
+    """Emotion distribution from all archived persons."""
+    return _q_archive(
+        """
+        SELECT COALESCE(emotion, 'Undetected') AS emotion, COUNT(*) AS count
+        FROM   person
+        GROUP  BY emotion
+        ORDER  BY count DESC
+        """
+    )
 
 
 @app.get("/api/recent")
 async def recent():
-    return _query("""
+    """Last 20 archived persons with web-accessible image paths."""
+    rows = _q_archive(
+        """
         SELECT track_id, best_conf, first_seen, last_seen,
                ROUND(last_seen - first_seen, 1) AS dwell,
                emotion, emotion_score, image_path
-        FROM person ORDER BY id DESC LIMIT 20
-    """)
+        FROM   person
+        ORDER  BY id DESC
+        LIMIT  20
+        """
+    )
+    for r in rows:
+        r["image_path"] = _web_path(r.get("image_path", ""))
+    return rows
+
+
+@app.get("/api/gallery/session")
+async def gallery_session():
+    """Session gallery: all unique exits, most-recent first."""
+    rows = _q_session(
+        """
+        SELECT cid, exit_count, first_exit, last_seen, image_path
+        FROM   session_gallery
+        ORDER  BY last_seen DESC
+        """
+    )
+    for r in rows:
+        r["image_path"] = _web_path(r.get("image_path", ""))
+    return rows
 
 
 @app.get("/api/gallery/flat")
 async def gallery_flat():
-    """All .jpg files currently in output/best/ (live best-frame buffer)."""
-    best = os.path.join(_BEST_DIR)
-    if not os.path.exists(best):
+    """All JPEG files directly inside output/best/ (live buffer)."""
+    if not os.path.exists(_BEST_DIR):
         return []
     files = sorted(
-        [f for f in os.listdir(best) if f.endswith(".jpg")],
-        key=lambda f: os.path.getmtime(os.path.join(best, f)),
+        [f for f in os.listdir(_BEST_DIR) if f.endswith(".jpg")],
+        key=lambda f: os.path.getmtime(os.path.join(_BEST_DIR, f)),
         reverse=True,
     )
     return [{"path": f"output/best/{f}", "name": f} for f in files]
@@ -240,139 +416,134 @@ async def gallery_flat():
 
 @app.get("/api/gallery/days")
 async def gallery_days():
-    """
-    Returns tree structure:
-    [{ day: "day_20260223", hours: [{ hour: "hour_09", images: [...] }] }]
-    """
+    """Archived images organised by day → hour → files."""
     if not os.path.exists(_BEST_DIR):
         return []
-    result = []
+    result   = []
     day_dirs = sorted(
-        [d for d in os.listdir(_BEST_DIR)
-         if os.path.isdir(os.path.join(_BEST_DIR, d)) and d.startswith("day_")],
+        [
+            d for d in os.listdir(_BEST_DIR)
+            if os.path.isdir(os.path.join(_BEST_DIR, d)) and d.startswith("day_")
+        ],
         reverse=True,
     )
     for day in day_dirs:
-        day_path = os.path.join(_BEST_DIR, day)
+        dp    = os.path.join(_BEST_DIR, day)
         hours = []
-        hour_dirs = sorted(
-            [h for h in os.listdir(day_path)
-             if os.path.isdir(os.path.join(day_path, h)) and h.startswith("hour_")],
+        for hour in sorted(
+            [
+                h for h in os.listdir(dp)
+                if os.path.isdir(os.path.join(dp, h)) and h.startswith("hour_")
+            ],
             reverse=True,
-        )
-        for hour in hour_dirs:
-            hour_path = os.path.join(day_path, hour)
+        ):
+            hp     = os.path.join(dp, hour)
             images = sorted(
-                [f for f in os.listdir(hour_path) if f.endswith(".jpg")],
-                key=lambda f: os.path.getmtime(os.path.join(hour_path, f)),
+                [f for f in os.listdir(hp) if f.endswith(".jpg")],
+                key=lambda f: os.path.getmtime(os.path.join(hp, f)),
                 reverse=True,
             )
-            hours.append({
-                "hour": hour,
-                "images": [
-                    {"path": f"output/best/{day}/{hour}/{f}", "name": f}
-                    for f in images
-                ],
-            })
+            hours.append(
+                {
+                    "hour":   hour,
+                    "images": [
+                        {"path": f"output/best/{day}/{hour}/{f}", "name": f}
+                        for f in images
+                    ],
+                }
+            )
         result.append({"day": day, "hours": hours})
     return result
 
 
-# ── Pipeline hooks ─────────────────────────────────────────────────────────────
-_prev_active_ids: set[int] = set()
-_last_heartbeat: float = 0.0
-# Store first_seen per track so we have it after person leaves active state
-_first_seen_cache: dict[int, float] = {}
+# ── Pipeline state ─────────────────────────────────────────────────────────────
+_prev_ids:   set       = set()
+_seen_cache: dict      = {}   # track_id → first_seen unix timestamp
+_active_ref: list[int] = [0]  # mutable single-element list so REST can read it
+_last_hb:    float     = 0.0
+_state:      dict      = {}
+_TWO_HOURS             = 7200
 
 
+# ── Pipeline hook ──────────────────────────────────────────────────────────────
 def notify(tracks: list[dict], identity_manager) -> None:
-    global _prev_active_ids, _last_heartbeat, _first_seen_cache
+    """
+    Called every pipeline tick with the current list of active track dicts.
 
-    now = time.time()
+    Emits events to both local WebSocket clients and the VPS:
+      • enter      — a new track_id appeared in the frame
+      • exit       — a track_id left the frame (includes dwell time)
+      • new_entry  — the global unique-exit counter incremented
+      • heartbeat  — sent at most once per second with live counts
+    """
+    global _prev_ids, _last_hb, _seen_cache
+
+    now         = time.time()
     current_ids = {t["track_id"] for t in tracks}
+    _active_ref[0] = len(current_ids)
 
-    # Safety net: purge cache entries older than 2 hours.
-    # Normally every entry is removed on exit, but if an exit event is
-    # ever missed (e.g. frame drop at the exact moment of disappearance)
-    # this prevents the dict growing unboundedly over a 3-day run.
-    _TWO_HOURS = 7200
-    stale_ids = [tid for tid, ts in _first_seen_cache.items()
-                 if now - ts > _TWO_HOURS]
-    for tid in stale_ids:
-        del _first_seen_cache[tid]
+    # Purge stale seen-cache entries (older than 2 h)
+    stale = [k for k, v in _seen_cache.items() if now - v > _TWO_HOURS]
+    for tid in stale:
+        del _seen_cache[tid]
 
-    # Cache first_seen while person is active (so we have it at exit time)
-    active_states = identity_manager.get_state()
-    for tid, state in active_states.items():
-        if tid not in _first_seen_cache:
-            _first_seen_cache[tid] = state.first_seen
+    # Populate seen-cache from identity_manager state
+    for tid, state in identity_manager.get_state().items():
+        if tid not in _seen_cache:
+            _seen_cache[tid] = state.first_seen
 
-    # ── Enter events ──────────────────────────────────────────────────────────
-    for tid in current_ids - _prev_active_ids:
-        track = next((t for t in tracks if t["track_id"] == tid), None)
-        if track:
-            _broadcast({
-                "event"   : "enter",
+    # Enter events
+    for tid in current_ids - _prev_ids:
+        t = next((x for x in tracks if x["track_id"] == tid), None)
+        if t:
+            _emit({
+                "event":    "enter",
                 "track_id": tid,
-                "conf"    : round(track["conf"], 3),
-                "ts"      : now,
+                "conf":     round(t.get("conf", 0), 3),
+                "zone":     t.get("zone") or "outside",
+                "ts":       now,
             })
 
-    # ── Exit events ───────────────────────────────────────────────────────────
-    for tid in _prev_active_ids - current_ids:
-        first = _first_seen_cache.pop(tid, None)
-        dwell = round(now - first, 1) if first else 0.0
-        _broadcast({
-            "event"         : "exit",
-            "track_id"      : tid,
-            "dwell"         : dwell,
-            "ts"            : now,
-            "refresh_recent": True,   # tells frontend to re-fetch gallery
+    # Exit events
+    for tid in _prev_ids - current_ids:
+        first = _seen_cache.pop(tid, None)
+        _emit({
+            "event":          "exit",
+            "track_id":       tid,
+            "dwell":          round(now - first, 1) if first else 0.0,
+            "ts":             now,
+            "refresh_recent": True,
         })
 
-    _prev_active_ids = current_ids
+    # New unique-exit event
+    unique = identity_manager.unique_exit_count
+    if unique != _state.get("last_unique", unique):
+        _emit({"event": "new_entry", "unique_count": unique, "ts": now})
+    _state["last_unique"] = unique
 
-    # ── Heartbeat every 1 second ──────────────────────────────────────────────
-    if now - _last_heartbeat >= 1.0:
-        _broadcast({
-            "event"       : "heartbeat",
+    _prev_ids = current_ids
+
+    # Heartbeat (max once per second)
+    if now - _last_hb >= 1.0:
+        _emit({
+            "event":        "heartbeat",
             "active_count": len(current_ids),
-            "ts"          : now,
+            "unique_count": unique,
+            "ts":           now,
         })
-        _last_heartbeat = now
+        _last_hb = now
 
 
-# ── Zone entry hooks ───────────────────────────────────────────────────────────
-# Track which zones have already been broadcast per track so we fire the
-# zone_count WebSocket event exactly once per track per zone.
-_zone_broadcast_seen: dict[int, set] = {}
-
-
-def notify_zone_entry(track_id: int, zone: str) -> None:
-    """
-    Call from main.py pipeline() each frame after identity.process() returns
-    a new zone entry for a track.  Broadcasts a zone_count WS event once per
-    track per zone — subsequent calls for the same (track_id, zone) are no-ops.
-    """
-    seen = _zone_broadcast_seen.setdefault(track_id, set())
-    if zone not in seen:
-        seen.add(zone)
-        _broadcast({
-            "event"   : "zone_count",
-            "zone"    : zone,
-            "track_id": track_id,
-            "ts"      : time.time(),
-        })
-
-
-def cleanup_zone_broadcast(track_id: int) -> None:
-    """Call when a track is permanently gone to free memory."""
-    _zone_broadcast_seen.pop(track_id, None)
-
-
+# ── Server entrypoint ──────────────────────────────────────────────────────────
 def start(host: str = "0.0.0.0", port: int = 8001) -> None:
-    cfg    = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    server = uvicorn.Server(cfg)
-    t = threading.Thread(target=server.run, daemon=True)
-    t.start()
+    # Wire up emotion-archived callback so background archive threads
+    # (which run outside asyncio) can forward the result to the backend WS.
+    from . import identity_manager as _im_mod
+    _im_mod._on_archived = lambda ev: _backend_enqueue_event(
+        {"type": "event", "cam": BACKEND_CAM_ID, "data": ev}
+    )
+
+    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    srv = uvicorn.Server(cfg)
+    threading.Thread(target=srv.run, daemon=True).start()
     print(f"[Dashboard] http://localhost:{port}")

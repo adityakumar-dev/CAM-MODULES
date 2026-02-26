@@ -1,25 +1,30 @@
 """
-main.py  —  Emotion Zone Counter pipeline
+main.py  —  Exit-cam pipeline
 """
 from __future__ import annotations
-import time
+
 import argparse
+import collections
+import time
+
 import cv2
-import numpy as np
+
 import config
-from manager.cv2_manager import CV2Manager
-from manager.yolo_detect import YoloDetector
+from manager.cv2_manager      import CV2Manager
+from manager.yolo_detect      import YoloDetector
 from manager.identity_manager import IdentityManager
 from manager import dashboard
-# ── Source ────────────────────────────────────────────────────────────────────
+
+# ── Args ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--source", default="webcam",
-                    choices=["webcam", "video", "rtsp"],
-                    help="Input source type")
-parser.add_argument("--path", default=None,
-                    help="File path or RTSP URL (required for video/rtsp)")
+                    choices=["webcam", "video", "rtsp"])
+parser.add_argument("--path",   default=None)
+parser.add_argument("--no-dashboard", action="store_true",
+                    help="Disable the web dashboard")
 args = parser.parse_args()
 
+# ── Source ────────────────────────────────────────────────────────────────────
 if args.source == "video" and args.path:
     from sources.video import VideoFileSource
     source = VideoFileSource(args.path)
@@ -34,96 +39,70 @@ else:
 detector = YoloDetector()
 identity = IdentityManager()
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
-dashboard.start()
+if not args.no_dashboard:
+    dashboard.start(
+        host=getattr(config, "DASHBOARD_HOST", "0.0.0.0"),
+        port=getattr(config, "DASHBOARD_PORT", 8001),
+    )
 
-# ── Zone polygon overlay helper ───────────────────────────────────────────────
-_ZONE_COLOURS = [
-    (0, 200, 255), (0, 255, 100), (255, 100, 0),
-    (200, 0, 255), (0, 150, 255), (255, 200, 0),
-]
-
-def _draw_zones(frame: np.ndarray) -> None:
-    zones = getattr(config, "ZONES", {})
-    for idx, (name, poly) in enumerate(zones.items()):
-        colour = _ZONE_COLOURS[idx % len(_ZONE_COLOURS)]
-        pts    = np.array(poly, dtype=np.int32)
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [pts], colour)
-        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-        cv2.polylines(frame, [pts], True, colour, 2)
-        # Label at centroid
-        cx = int(np.mean([p[0] for p in poly]))
-        cy = int(np.mean([p[1] for p in poly]))
-        cv2.putText(frame, name, (cx - 30, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
+# ── FPS (thread-safe deque) ───────────────────────────────────────────────────
+_fps_buf: collections.deque = collections.deque(maxlen=30)
 
 
-# ── Track zone broadcast state ────────────────────────────────────────────────
-# Keep the last counted_zones set per track so we only broadcast new entries.
-_prev_counted: dict[int, set] = {}
+def _fps() -> float:
+    now = time.perf_counter()
+    _fps_buf.append(now)
+    if len(_fps_buf) < 2:
+        return 0.0
+    return (len(_fps_buf) - 1) / (_fps_buf[-1] - _fps_buf[0])
+
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
-def pipeline(frame: np.ndarray) -> np.ndarray:
-    global _prev_counted
-
-    # 1. YOLO + ByteTrack
+def pipeline(frame):
+    # 1. Detect + track
     raw_tracks = detector.process_with_tracking(frame)
 
-    # 2. Zone tracking + best-frame capture + (within-session) re-ID
+    # 2. ReID + zone crossing + dedup + count
     tracks = identity.process(frame, raw_tracks)
 
-    # 3. Broadcast new zone entries via WebSocket
-    current_ids = {t["track_id"] for t in tracks}
-    for t in tracks:
-        tid = t["track_id"]
-        new_zones = set(t.get("counted_zones", [])) - _prev_counted.get(tid, set())
-        for zone in new_zones:
-            dashboard.notify_zone_entry(tid, zone)
-        _prev_counted[tid] = set(t.get("counted_zones", []))
+    # 3. Zone overlay
+    identity.draw_zones(frame)
 
-    # Clean up state for gone tracks
-    gone = set(_prev_counted) - current_ids
-    for tid in gone:
-        del _prev_counted[tid]
-        dashboard.cleanup_zone_broadcast(tid)
-
-    # 4. Notify dashboard (enter / exit / heartbeat)
-    dashboard.notify(tracks, identity)
-
-    # 5. Draw zones
-    _draw_zones(frame)
-
-    # 6. Draw bounding boxes, IDs, and current zone label
+    # 4. Bounding boxes + labels
+    _exit_zone_name = getattr(config, "EXIT_ZONE_NAME", "exit")
+    in_zone_count   = sum(1 for t in tracks if t.get("zone") == _exit_zone_name)
     for t in tracks:
         x1, y1, x2, y2 = t["x1"], t["y1"], t["x2"], t["y2"]
-        zone  = t.get("zone") or ""
-        label = f"ID {t['track_id']}"
-        if zone:
-            label += f" [{zone}]"
-
-        # Colour box green if in a zone, white otherwise
-        colour = (0, 255, 0) if zone else (200, 200, 200)
+        in_zone = t.get("zone") == _exit_zone_name
+        zone    = t.get("zone") or "outside"
+        conf    = t.get("conf", 0.0)
+        # Green = in exit zone, cyan = in some other zone, gray = outside
+        colour  = (0, 255, 0) if in_zone else ((0, 220, 220) if t.get("zone") else (160, 160, 160))
+        label   = f"ID {t['track_id']}  [{zone}]  {conf:.0%}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-        cv2.putText(frame, label, (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
+        cv2.putText(
+            frame, label, (x1, y1 - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2, cv2.LINE_AA,
+        )
 
-    # 7. HUD — active count + per-zone counts
-    hud_lines = [f"Active: {len(tracks)}"]
-    zone_totals: dict[str, int] = {}
-    for t in tracks:
-        z = t.get("zone")
-        if z:
-            zone_totals[z] = zone_totals.get(z, 0) + 1
-    for z, cnt in zone_totals.items():
-        hud_lines.append(f"  {z}: {cnt}")
-
+    # 5. HUD
+    hud_lines = [
+        f"Unique exits : {identity.unique_exit_count}",
+        f"In frame     : {identity.active_count()}",
+        f"In zone      : {in_zone_count}",
+        f"FPS          : {_fps():.1f}",
+    ]
     for i, line in enumerate(hud_lines):
-        cv2.putText(frame, line, (10, 28 + i * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        y = 28 + i * 28
+        cv2.putText(frame, line, (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, line, (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # 8. Push to MJPEG stream
-    dashboard.push_frame(frame)
+    # 6. Dashboard hooks
+    if not args.no_dashboard:
+        dashboard.push_frame(frame)
+        dashboard.notify(tracks, identity)
 
     return frame
 

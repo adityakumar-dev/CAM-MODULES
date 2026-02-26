@@ -28,6 +28,7 @@ De-duplication:
 """
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import time
@@ -60,7 +61,10 @@ _MERGE_PX       : int   = int  (getattr(config, "ENTRY_TEMP_MERGE_PX",         6
 _DETECTOR_ZONE  : str       = _COUNT_TRIGGER.split("\u2192")[0].strip()
 _INSIDE_ZONE    : str       = _COUNT_TRIGGER.split("\u2192")[1].strip()
 _CAPTURE_ZONES  : frozenset = frozenset({_DETECTOR_ZONE, _INSIDE_ZONE})
-
+# Callbacks registered by dashboard so background threads can forward events
+# to the backend WS.  Set via: identity_manager._on_captured = fn, etc.
+_on_captured: Optional[callable] = None  # fired when a person image is archived
+_on_reentry:  Optional[callable] = None  # fired when a known person re-enters
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -344,6 +348,11 @@ class IdentityManager:
         if match_cid is not None:
             self._gallery.upsert(match_cid, best_emb, image_path=img_path)
             print(f"[Entry] {reason}: cid={cid} → matched {match_cid} — returning visitor")
+            if _on_reentry is not None:
+                try:
+                    _on_reentry(match_cid, self._gallery.entry_count(match_cid))
+                except Exception:
+                    pass
         else:
             self._gallery.upsert(cid, best_emb, image_path=img_path)
             self.unique_entry_count = self._gallery.total_unique()
@@ -601,3 +610,21 @@ def _archive_worker(src: str, dst: str, track_id: Any,
         except OSError:
             pass
     save_person_metadata(track_id, best_conf, first_seen, last_seen, dst)
+
+    # Forward to backend WS (non-blocking — dashboard registers this callback)
+    if _on_captured is not None:
+        try:
+            img_b64 = None
+            try:
+                with open(dst, "rb") as _f:
+                    img_b64 = base64.b64encode(_f.read()).decode()
+            except Exception:
+                pass
+            _on_captured({
+                "event":    "captured",
+                "track_id": track_id,
+                "image":    img_b64,
+                "ts":       time.time(),
+            })
+        except Exception:
+            pass

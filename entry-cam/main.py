@@ -47,7 +47,7 @@ identity = IdentityManager()
 if not args.no_dashboard:
     dashboard.start(
         host=getattr(config, "DASHBOARD_HOST", "0.0.0.0"),
-        port=getattr(config, "DASHBOARD_PORT", 8000),
+        port=getattr(config, "DASHBOARD_PORT", 8002),
     )
 
 # ── FPS (thread-safe deque) ───────────────────────────────────────────────────

@@ -80,6 +80,7 @@ class YoloDetector:
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            imgsz=config.YOLO_IMGSZ,
             classes=[0],   # person only
             verbose=False,
         )[0]
@@ -110,6 +111,7 @@ class YoloDetector:
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            imgsz=config.YOLO_IMGSZ,
             classes=[0],          # person only
             persist=True,         # keep tracker state between calls
             tracker="bytetrack.yaml",

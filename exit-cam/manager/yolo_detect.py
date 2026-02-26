@@ -1,17 +1,43 @@
 """
-YoloDetector  — DEBUG BUILD
-============================
-All original logic preserved. DEBUG lines marked with  # <<< DEBUG
+YoloDetector
+============
+Two modes:
+  process()               → plain detection, returns [(x1,y1,x2,y2,conf)]
+  process_with_tracking() → ByteTrack via model.track(), returns list of dicts
+                            with keys: track_id, x1, y1, x2, y2, conf, is_temp_id
+
+Temporary ID Strategy:
+  When ByteTrack hasn't yet assigned a confirmed integer ID to a detection
+  (box.id is None — common on first 2-3 frames or after occlusion), we
+  assign a unique temporary string ID like "tmp_<uuid4_short>" instead of
+  skipping the detection or using -1.
+
+  WHY: Skipping means the person is invisible to IdentityManager for those
+  frames. If they cross the counting zone during that window they are MISSED.
+  Using -1 is worse — all untracked detections collide under the same fake ID.
+
+  IdentityManager is responsible for:
+    1. Tracking tmp IDs through zone transitions normally.
+    2. Merging a tmp ID -> real ID when ByteTrack later confirms it,
+       by spatial proximity (centroid distance matching).
+    3. Ensuring the merged entry is counted only once.
+
+  The 'is_temp_id' flag in the returned dict lets IdentityManager know
+  which entries need merge-watching.
 """
 from __future__ import annotations
 
+import uuid
 from typing import List, Tuple
+
 import numpy as np
 from ultralytics import YOLO
+
 import config
 
 
 def _to_float(val) -> float:
+    """Safely convert any tensor / ndarray / scalar to a Python float."""
     if hasattr(val, "item"):
         return float(val.item())
     if isinstance(val, np.ndarray):
@@ -19,34 +45,46 @@ def _to_float(val) -> float:
     return float(val)
 
 
-class YoloDetector:
+def _safe_int(val) -> int | None:
+    """
+    Extract integer from a tensor/ndarray/scalar.
+    Returns None if val is None or extraction fails.
+    """
+    if val is None:
+        return None
+    try:
+        return int(_to_float(val))
+    except Exception:
+        return None
 
+
+def _new_temp_id() -> str:
+    """Generate a short unique temporary track ID string."""
+    return f"tmp_{uuid.uuid4().hex[:8]}"
+
+
+class YoloDetector:
     def __init__(self, model_path: str | None = None) -> None:
         self.model_path     = model_path or config.YOLO_MODEL_PATH
         self.conf_threshold = config.YOLO_CONFIDENCE_THRESHOLD
         self.iou_threshold  = config.YOLO_IOU_THRESHOLD
         self.device         = config.YOLO_DEVICE
         self.model          = YOLO(self.model_path)
-        self._unconfirmed_counter: int = -1
 
-        # <<< DEBUG
-        self._frame_count: int = 0
-        print(f"[YOLO] Detector init | conf_thresh={self.conf_threshold} | "
-              f"iou_thresh={self.iou_threshold} | device={self.device} | "
-              f"model={self.model_path}")
-        # <<< DEBUG END
-
-    # ── Plain detection ───────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Plain detection (no tracking)
+    # ------------------------------------------------------------------
     def process(self, frame: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
         results = self.model.predict(
             frame,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
-            classes=[0],
+            imgsz=config.YOLO_IMGSZ,
+            classes=[0],   # person only
             verbose=False,
         )[0]
+
         detections = []
         for box in results.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -54,73 +92,61 @@ class YoloDetector:
             detections.append((x1, y1, x2, y2, conf))
         return detections
 
-    # ── Detection + ByteTrack ─────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Detection + ByteTrack via model.track()
+    # ------------------------------------------------------------------
     def process_with_tracking(self, frame: np.ndarray) -> List[dict]:
-        # <<< DEBUG
-        self._frame_count += 1
-        frame_no = self._frame_count
-        # <<< DEBUG END
+        """
+        Returns list of dicts with keys:
+            track_id  : int (confirmed) or str like "tmp_a3f9b2c1" (unconfirmed)
+            x1, y1, x2, y2 : int
+            conf      : float
+            is_temp_id: bool  True when ByteTrack has not confirmed the ID yet
 
+        NO detections are dropped. Every visible person is returned.
+        IdentityManager handles merging tmp -> real IDs via spatial matching.
+        """
         results = self.model.track(
             frame,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
-            classes=[0],
-            persist=True,
+            imgsz=config.YOLO_IMGSZ,
+            classes=[0],          # person only
+            persist=True,         # keep tracker state between calls
             tracker="bytetrack.yaml",
             verbose=False,
         )[0]
 
-        tracks = []
-        if results.boxes is None:
-            # <<< DEBUG
-            print(f"[YOLO] frame={frame_no} | results.boxes is None — no detections at all")
-            # <<< DEBUG END
-            return tracks
+        tracks: List[dict] = []
 
-        # <<< DEBUG
-        total_boxes = len(results.boxes)
-        confirmed_count   = 0
-        unconfirmed_count = 0
-        # <<< DEBUG END
+        if results.boxes is None:
+            return tracks
 
         for box in results.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = _to_float(box.conf)
-            box_w = x2 - x1
-            box_h = y2 - y1
+            conf    = _to_float(box.conf)
+            real_id = _safe_int(box.id)
 
-            if box.id is not None:
-                track_id = int(_to_float(box.id))
-                # <<< DEBUG
-                confirmed_count += 1
-                print(f"[YOLO] frame={frame_no} | CONFIRMED track_id={track_id} | "
-                      f"conf={conf:.3f} | box=({x1},{y1},{x2},{y2}) | "
-                      f"size={box_w}x{box_h}px")
-                # <<< DEBUG END
+            if real_id is not None:
+                # Confirmed ByteTrack ID
+                tracks.append(dict(
+                    track_id=real_id,
+                    x1=x1, y1=y1,
+                    x2=x2, y2=y2,
+                    conf=conf,
+                    is_temp_id=False,
+                ))
             else:
-                track_id = self._unconfirmed_counter
-                self._unconfirmed_counter -= 1
-                # <<< DEBUG
-                unconfirmed_count += 1
-                print(f"[YOLO] frame={frame_no} | UNCONFIRMED box.id=None → "
-                      f"synthetic_id={track_id} | conf={conf:.3f} | "
-                      f"box=({x1},{y1},{x2},{y2}) | size={box_w}x{box_h}px  "
-                      f"⚠️  This will be DROPPED by IdentityManager (bt_id <= 0 filter)")
-                # <<< DEBUG END
-
-            tracks.append(dict(
-                track_id=track_id,
-                x1=x1, y1=y1, x2=x2, y2=y2,
-                conf=conf,
-            ))
-
-        # <<< DEBUG
-        if total_boxes > 0:
-            print(f"[YOLO] frame={frame_no} | SUMMARY: {total_boxes} box(es) — "
-                  f"{confirmed_count} confirmed, {unconfirmed_count} unconfirmed/synthetic")
-        # <<< DEBUG END
+                # Unconfirmed detection: assign unique temp ID.
+                # Each unconfirmed box gets its OWN temp ID (not shared),
+                # so two unconfirmed people do not collide under one ID.
+                tracks.append(dict(
+                    track_id=_new_temp_id(),
+                    x1=x1, y1=y1,
+                    x2=x2, y2=y2,
+                    conf=conf,
+                    is_temp_id=True,
+                ))
 
         return tracks

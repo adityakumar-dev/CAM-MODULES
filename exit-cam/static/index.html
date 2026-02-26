@@ -815,15 +815,15 @@
     </div>
 
     <div class="card stat-card">
-      <div class="stat-label">Avg Dwell</div>
+      <div class="stat-label">Unique Total</div>
       <div class="stat-value" id="stat-dwell">—</div>
-      <div class="stat-sub">seconds in zone</div>
+      <div class="stat-sub">all-time unique exits</div>
     </div>
 
     <div class="card stat-card">
-      <div class="stat-label">Avg Confidence</div>
+      <div class="stat-label">Active Now</div>
       <div class="stat-value" id="stat-conf">—</div>
-      <div class="stat-sub">detection score</div>
+      <div class="stat-sub">in frame right now</div>
     </div>
 
     <!-- Event log -->
@@ -928,6 +928,10 @@
         const msg = JSON.parse(e.data);
         if (msg.event === 'heartbeat') {
           document.getElementById('live-count').textContent = msg.active_count;
+          document.getElementById('stat-conf').textContent = msg.active_count;
+        } else if (msg.event === 'new_entry') {
+          logEvent('UNIQUE', `Unique exits: ${msg.unique_count}`, 'enter');
+          fetchStats();
         } else if (msg.event === 'enter') {
           logEvent('ENTER', `ID ${msg.track_id}  conf ${msg.conf.toFixed(2)}`, 'enter');
         } else if (msg.event === 'exit') {
@@ -936,7 +940,7 @@
             // Delay = reid_buffer_seconds + 2s padding so DB write is guaranteed done
             setTimeout(() => {
               fetchRecent();
-              fetchToday();
+              fetchStats();
               fetchEmotions();
               if (document.getElementById('gallery-overlay').classList.contains('open')) {
                 loadGalleryTab(currentGalleryTab);
@@ -961,12 +965,12 @@
     }
 
     // ══ REST ══════════════════════════════════════════════════════════════════
-    async function fetchToday() {
+    async function fetchStats() {
       try {
-        const d = await fetch(`${BASE}/api/stats/today`).then(r => r.json());
-        document.getElementById('stat-total').textContent = d.total ?? '—';
-        document.getElementById('stat-dwell').textContent = d.avg_dwell ?? '—';
-        document.getElementById('stat-conf').textContent = d.avg_conf ?? '—';
+        const d = await fetch(`${BASE}/api/stats/session`).then(r => r.json());
+        document.getElementById('stat-total').textContent = d.today_count  ?? '—';
+        document.getElementById('stat-dwell').textContent = d.unique_total ?? '—';
+        document.getElementById('stat-conf').textContent  = d.active_now   ?? '—';
       } catch (e) { }
     }
 
@@ -1035,7 +1039,7 @@
     }
 
     async function fetchAll() {
-      await Promise.all([fetchToday(), fetchHourly(), fetchEmotions(), fetchRecent()]);
+      await Promise.all([fetchStats(), fetchHourly(), fetchEmotions(), fetchRecent()]);
     }
 
     // ══ STREAM DIALOG ═════════════════════════════════════════════════════════
@@ -1147,15 +1151,8 @@
 
     // ══ INIT ══════════════════════════════════════════════════════════════════
     async function init() {
-      // Fetch pipeline config so refresh delay matches the real reid_buffer_seconds
-      try {
-        const cfg = await fetch(`${BASE}/api/config`).then(r => r.json());
-        // Add 2s padding on top of the buffer so the DB write is guaranteed done
-        _refreshDelayMs = (cfg.reid_buffer_seconds + 2) * 1000;
-      } catch (e) {
-        // Fall back to default if server not ready yet
-        _refreshDelayMs = 12000;
-      }
+      // Reid buffer = 30s + 2s padding; matches EXIT_REID_BUFFER_SECONDS in config.py
+      _refreshDelayMs = 32000;
 
       connectWS();
       fetchAll();

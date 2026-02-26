@@ -13,7 +13,23 @@ YOLO_MODEL_PATH           = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
 YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.15"))
 YOLO_IOU_THRESHOLD        = float(os.getenv("YOLO_IOU",  "0.45"))
 YOLO_DEVICE               = os.getenv("YOLO_DEVICE", "cpu")   # "cpu" | "cuda" | "mps"
+YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "640"))  # inference resolution
 
+
+# ---------------------------------------------------------------------------
+# Backend WebSocket forwarding
+# Camera connects OUT to your backend — no port needs to be exposed.
+# ---------------------------------------------------------------------------
+# URL of your backend WS endpoint, e.g. "wss://yourbackend.com/cam/stream"
+# Leave empty to disable all backend forwarding.
+BACKEND_WS_URL   = os.getenv("BACKEND_WS_URL",   "wss://enabled-flowing-bedbug.ngrok-free.app/cam/stream")
+# Shared secret sent as Bearer token in the WS upgrade header.
+BACKEND_WS_TOKEN = os.getenv("BACKEND_WS_TOKEN", "")
+
+# Identifier sent with every message so your backend knows which camera.
+BACKEND_CAM_ID   = os.getenv("BACKEND_CAM_ID",   "entry-cam")
+# Live frames forwarded per second. Set to 0 to disable frame forwarding.
+BACKEND_FRAME_FPS = float(os.getenv("BACKEND_FRAME_FPS", "1"))
 
 # ---------------------------------------------------------------------------
 # Re-ID buffer
@@ -35,7 +51,7 @@ ZONES: dict = {}
 # ---------------------------------------------------------------------------
 # Source / display
 # ---------------------------------------------------------------------------
-SOURCE_FPS   = int(os.getenv("SOURCE_FPS", "30"))
+SOURCE_FPS   = os.getenv("SOURCE_FPS", None)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry Module — add these to your existing config.py
