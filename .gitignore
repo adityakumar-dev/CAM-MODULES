@@ -23,3 +23,5 @@ exit-cam/sources/__pycache_/
 entry-cam/sources/__pycache__/
 exit-cam/manager/__pycache__/
 entry-cam/manager/__pycache__/
+
+.venv
