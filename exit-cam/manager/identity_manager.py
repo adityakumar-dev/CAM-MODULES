@@ -186,14 +186,14 @@ def _analyse_emotion(image_path: str) -> Tuple[Optional[str], Optional[float]]:
             label = "Very Happy" if top_conf >= _VERY_HAPPY_THRESHOLD else "Happy"
             return label, top_conf
 
-        if predicted == "surprise":
+        if predicted in ("surprise", "neutral"):
             return "Happy", top_conf
 
         if predicted in ("sad", "angry", "anger", "fear", "disgust", "contempt"):
             return "Sad", top_conf
 
-        # neutral / other — still assign label so it shows in stats
-        return "Neutral", top_conf
+        # any other label → Happy (default positive assumption)
+        return "Happy", top_conf
 
     except Exception as exc:
         print(f"[Emotion] ERROR {os.path.basename(image_path)}: {exc}")
