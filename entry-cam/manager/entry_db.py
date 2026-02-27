@@ -154,6 +154,7 @@ class EntryDB:
         Return visit -> blend embedding + increment count.
         Updates RAM cache immediately.
         """
+        cid = int(cid)  # ensure Python native int — numpy int64 causes datatype mismatch on INTEGER PK
         now = now or time.time()
 
         if cid in self._embeddings:
@@ -194,6 +195,7 @@ class EntryDB:
         self._conn.commit()
 
     def update_last_seen(self, cid: int, now: Optional[float] = None) -> None:
+        cid = int(cid)
         now = now or time.time()
         self._conn.execute(
             "UPDATE session_gallery SET last_seen=? WHERE cid=?", (now, cid)
@@ -202,6 +204,7 @@ class EntryDB:
 
     def update_image_path(self, cid: int, image_path: str) -> None:
         """Update thumbnail when a better-conf frame is archived."""
+        cid = int(cid)
         if cid not in self._embeddings:
             return
         self._image_paths[cid] = image_path

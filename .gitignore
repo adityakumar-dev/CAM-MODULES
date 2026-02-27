@@ -3,3 +3,23 @@ exit-cam/__pycache__
 exit-cam_test2/output/
 exit-cam/.venv
 safe_test_3/output/
+test.mp4
+test2.mp4
+
+# Ignore exit-cam output completely
+exit-cam/output/
+
+# Extra safety (optional granular)
+exit-cam/output/best/
+exit-cam/output/*.db
+exit-cam/output/*.db-shm
+exit-cam/output/*.db-wal
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+exit-cam/sources/__pycache_/
+entry-cam/sources/__pycache__/
+exit-cam/manager/__pycache__/
+entry-cam/manager/__pycache__/

@@ -152,6 +152,7 @@ class ExitDB:
         Return visit -> blend embedding + increment count.
         Updates RAM cache immediately.
         """
+        cid = int(cid)  # ensure Python native int — numpy int64 causes datatype mismatch on INTEGER PK
         now = now or time.time()
 
         if cid in self._embeddings:
@@ -192,6 +193,7 @@ class ExitDB:
         self._conn.commit()
 
     def update_last_seen(self, cid: int, now: Optional[float] = None) -> None:
+        cid = int(cid)
         now = now or time.time()
         self._conn.execute(
             "UPDATE session_gallery SET last_seen=? WHERE cid=?", (now, cid)

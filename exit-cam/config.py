@@ -10,8 +10,8 @@ import os
 # YOLO detection
 # ---------------------------------------------------------------------------
 YOLO_MODEL_PATH           = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
-YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.35"))
-YOLO_IOU_THRESHOLD        = float(os.getenv("YOLO_IOU",  "0.45"))
+YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.15"))
+YOLO_IOU_THRESHOLD        = float(os.getenv("YOLO_IOU",  "0.25"))
 YOLO_DEVICE               = os.getenv("YOLO_DEVICE", "cpu")   # "cpu" | "cuda" | "mps"
 YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "320"))  # inference resolution — 320 is ~3× faster than 640 on CPU
 
@@ -32,9 +32,11 @@ BACKEND_FRAME_FPS = float(os.getenv("BACKEND_FRAME_FPS", "1"))
 # ---------------------------------------------------------------------------
 # Emotion thresholds  (analysis runs at archive time, not live)
 # ---------------------------------------------------------------------------
-EMOTION_HAPPY_THRESHOLD      = 0.40
-EMOTION_VERY_HAPPY_THRESHOLD = 0.75
-EMOTION_SAD_THRESHOLD        = 0.40
+# Minimum confidence score to assign any emotion label (was 0.40, lowered for CCTV)
+EMOTION_MIN_SCORE            = 0.25
+EMOTION_HAPPY_THRESHOLD      = 0.25
+EMOTION_VERY_HAPPY_THRESHOLD = 0.65
+EMOTION_SAD_THRESHOLD        = 0.25
 EMOTIEFF_MODEL               = os.getenv("EMOTIEFF_MODEL", "enet_b0_8_best_afew")
 
 # ---------------------------------------------------------------------------

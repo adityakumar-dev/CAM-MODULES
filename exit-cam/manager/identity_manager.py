@@ -43,6 +43,44 @@ from .db_helper  import save_person_metadata, increment_zone_count, close as _db
 from .exit_db    import ExitDB
 from .zone_manager import ZoneManager
 
+
+def _atomic_imwrite(path: str, img) -> bool:
+    """
+    Write an image atomically: encode to JPEG bytes, write to .tmp, then
+    os.replace() into place.  Using imencode avoids OpenCV choosing the wrong
+    codec based on the '.tmp' extension.
+    On Windows, os.replace() raises PermissionError if the destination is
+    currently open — retried up to 3 times with a short sleep.
+    """
+    try:
+        import cv2 as _cv2
+        import time as _time
+        if img is None or img.size == 0:
+            print(f"[Exit][imwrite] SKIP — empty crop for {path}")
+            return False
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        ok, buf = _cv2.imencode(".jpg", img)
+        if not ok:
+            print(f"[Exit][imwrite] FAIL — imencode returned False  shape={img.shape}")
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as _f:
+            _f.write(buf.tobytes())
+        for _attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if _attempt < 2:
+                    _time.sleep(0.05)
+                else:
+                    raise
+        print(f"[Exit][imwrite] OK  → {path}  shape={img.shape}")
+        return True
+    except Exception as _e:
+        print(f"[Exit][imwrite] EXCEPTION for {path}: {_e}")
+        return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,9 +95,10 @@ _MERGE_PX       : int   = 60   # centroid distance threshold for temp→real ID 
 
 _EXIT_ZONE      : str   = getattr(config, "EXIT_ZONE_NAME", "exit")
 
-_HAPPY_THRESHOLD:      float = getattr(config, "EMOTION_HAPPY_THRESHOLD",      0.40)
-_VERY_HAPPY_THRESHOLD: float = getattr(config, "EMOTION_VERY_HAPPY_THRESHOLD", 0.75)
-_SAD_THRESHOLD:        float = getattr(config, "EMOTION_SAD_THRESHOLD",        0.40)
+_HAPPY_THRESHOLD:      float = getattr(config, "EMOTION_HAPPY_THRESHOLD",      0.25)
+_VERY_HAPPY_THRESHOLD: float = getattr(config, "EMOTION_VERY_HAPPY_THRESHOLD", 0.65)
+_SAD_THRESHOLD:        float = getattr(config, "EMOTION_SAD_THRESHOLD",        0.25)
+_MIN_SCORE:            float = getattr(config, "EMOTION_MIN_SCORE",            0.25)
 _EMOTIEFF_MODEL: str          = getattr(config, "EMOTIEFF_MODEL", "enet_b0_8_best_afew")
 
 # Callback registered by dashboard so background archive threads can forward
@@ -139,6 +178,10 @@ def _analyse_emotion(image_path: str) -> Tuple[Optional[str], Optional[float]]:
 
         print(f"[Emotion] {os.path.basename(image_path)} → {predicted} ({top_conf:.2f})")
 
+        # Below minimum confidence — don't assign any label
+        if top_conf < _MIN_SCORE:
+            return None, None
+
         if predicted == "happy":
             label = "Very Happy" if top_conf >= _VERY_HAPPY_THRESHOLD else "Happy"
             return label, top_conf
@@ -149,8 +192,8 @@ def _analyse_emotion(image_path: str) -> Tuple[Optional[str], Optional[float]]:
         if predicted in ("sad", "angry", "anger", "fear", "disgust", "contempt"):
             return "Sad", top_conf
 
-        # neutral → no displayable emotion
-        return None, None
+        # neutral / other — still assign label so it shows in stats
+        return "Neutral", top_conf
 
     except Exception as exc:
         print(f"[Emotion] ERROR {os.path.basename(image_path)}: {exc}")
@@ -455,7 +498,8 @@ class IdentityManager:
 
         stored_conf = 0.0 if is_new else state.best_conf
         if is_new or conf >= stored_conf:
-            self._write_pool.submit(cv2.imwrite, img_path, crop.copy())
+            print(f"[Exit][capture] cid={cid}  conf={conf:.3f}  stored={stored_conf:.3f}  new={is_new}  → {img_path}")
+            self._write_pool.submit(_atomic_imwrite, img_path, crop.copy())
             self._img_path[cid] = img_path
             if self._gallery.contains(cid):
                 self._write_pool.submit(self._gallery.update_image_path, cid, img_path)
@@ -496,11 +540,12 @@ class IdentityManager:
         if not src or not os.path.exists(src):
             return
 
-        dst_dir = self._archive_dir(datetime.now())
-        safe    = str(cid).replace("tmp_", "tmp")
-        dst     = os.path.join(dst_dir, f"id_{safe}_conf_{entry.best_conf:.2f}.jpg")
+        dst_dir     = self._archive_dir(datetime.now())
+        safe        = str(cid).replace("tmp_", "tmp")
+        dst         = os.path.join(dst_dir, f"id_{safe}_conf_{entry.best_conf:.2f}.jpg")
+        db_track_id = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
         self._write_pool.submit(
-            _archive_worker, src, dst, cid,
+            _archive_worker, src, dst, db_track_id,
             entry.best_conf, entry.first_seen, entry.last_seen,
             entry.last_zone,
         )
@@ -570,6 +615,8 @@ class IdentityManager:
             # Mirrors entry-cam's in_capture guard exactly.
             # Person's bounding-box crop is saved; full frame is never written.
             if in_exit:
+                if cid not in self._img_path:
+                    print(f"[Exit][zone] cid={cid} ENTERED exit zone")
                 self._update_best(cid, conf, crop, state)
 
         # ── Disappeared → lost buffer (no archive yet) ────────────────────────
@@ -638,13 +685,9 @@ class IdentityManager:
 
 def _rename_worker(src: str, dst: str) -> None:
     try:
-        os.rename(src, dst)
+        shutil.move(src, dst)
     except OSError:
-        try:
-            shutil.copy2(src, dst)
-            os.remove(src)
-        except OSError:
-            pass
+        pass
 
 
 def _discard_worker(path: str) -> None:
@@ -658,13 +701,9 @@ def _archive_worker(src: str, dst: str, track_id: Any,
                     best_conf: float, first_seen: float, last_seen: float,
                     zone: Optional[str] = None) -> None:
     try:
-        os.rename(src, dst)
+        shutil.move(src, dst)
     except OSError:
-        try:
-            shutil.copy2(src, dst)
-            os.remove(src)
-        except OSError:
-            pass
+        pass
 
     emotion, emotion_score = _analyse_emotion(dst)
 

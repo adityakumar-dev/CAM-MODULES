@@ -45,6 +45,44 @@ from .db_helper    import save_person_metadata, close as _db_close
 from .entry_db     import EntryDB
 from .zone_manager import ZoneManager
 
+
+def _atomic_imwrite(path: str, img) -> bool:
+    """
+    Write an image atomically: encode to JPEG bytes, write to .tmp, then
+    os.replace() into place.  Using imencode avoids OpenCV choosing the wrong
+    codec based on the '.tmp' extension.
+    On Windows, os.replace() raises PermissionError if the destination is
+    currently open — retried up to 3 times with a short sleep.
+    """
+    try:
+        import cv2 as _cv2
+        import time as _time
+        if img is None or img.size == 0:
+            print(f"[Entry][imwrite] SKIP — empty crop for {path}")
+            return False
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        ok, buf = _cv2.imencode(".jpg", img)
+        if not ok:
+            print(f"[Entry][imwrite] FAIL — imencode returned False  shape={img.shape}")
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as _f:
+            _f.write(buf.tobytes())
+        for _attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if _attempt < 2:
+                    _time.sleep(0.05)
+                else:
+                    raise
+        print(f"[Entry][imwrite] OK  → {path}  shape={img.shape}")
+        return True
+    except Exception as _e:
+        print(f"[Entry][imwrite] EXCEPTION for {path}: {_e}")
+        return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
@@ -356,9 +394,11 @@ class IdentityManager:
                 except Exception:
                     pass
         else:
-            self._gallery.upsert(cid, best_emb, image_path=img_path)
+            # SQLite INTEGER PK requires a plain int — convert tmp_ strings
+            gallery_cid = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
+            self._gallery.upsert(gallery_cid, best_emb, image_path=img_path)
             self.unique_entry_count = self._gallery.total_unique()
-            print(f"[Entry] {reason}: NEW  cid={cid}  emb_norm={emb_norm:.3f}  total={self.unique_entry_count}")
+            print(f"[Entry] {reason}: NEW  cid={cid}  gallery_cid={gallery_cid}  emb_norm={emb_norm:.3f}  total={self.unique_entry_count}")
 
     # ── Best frame: capture-and-replace (ONE file per person) ────────────────
 
@@ -376,7 +416,8 @@ class IdentityManager:
         # We only write if this is new OR current conf genuinely exceeds stored best
         stored_conf = 0.0 if is_new else state.best_conf
         if is_new or conf >= stored_conf:
-            self._write_pool.submit(cv2.imwrite, img_path, crop.copy())
+            print(f"[Entry][capture] cid={cid}  conf={conf:.3f}  stored={stored_conf:.3f}  new={is_new}  → {img_path}")
+            self._write_pool.submit(_atomic_imwrite, img_path, crop.copy())
             self._img_path[cid] = img_path
             if self._gallery.contains(cid):
                 self._write_pool.submit(self._gallery.update_image_path, cid, img_path)
@@ -408,9 +449,10 @@ class IdentityManager:
                     self._gallery.upsert(match_cid, entry.best_embedding, image_path=src)
                     print(f"[Entry] safety_net: cid={cid} matched {match_cid} — returning visitor")
                 else:
-                    self._gallery.upsert(cid, entry.best_embedding, image_path=src)
+                    gallery_cid = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
+                    self._gallery.upsert(gallery_cid, entry.best_embedding, image_path=src)
                     self.unique_entry_count = self._gallery.total_unique()
-                    print(f"[Entry] safety_net: NEW  cid={cid}  total={self.unique_entry_count}")
+                    print(f"[Entry] safety_net: NEW  cid={cid}  gallery_cid={gallery_cid}  total={self.unique_entry_count}")
                 # Fall through to archive since they are now counted
             else:
                 # Truly never in security zone — discard silently
@@ -422,11 +464,12 @@ class IdentityManager:
             return
 
         # Use best_conf from entry (highest observed across entire visit)
-        dst_dir = self._archive_dir(datetime.now())
-        safe    = str(cid).replace("tmp_", "tmp")
-        dst     = os.path.join(dst_dir, f"id_{safe}_conf_{entry.best_conf:.2f}.jpg")
+        dst_dir     = self._archive_dir(datetime.now())
+        safe        = str(cid).replace("tmp_", "tmp")
+        dst         = os.path.join(dst_dir, f"id_{safe}_conf_{entry.best_conf:.2f}.jpg")
+        db_track_id = cid if isinstance(cid, int) else abs(hash(str(cid))) & 0x7FFFFFFF
         self._write_pool.submit(
-            _archive_worker, src, dst, cid,
+            _archive_worker, src, dst, db_track_id,
             entry.best_conf, entry.first_seen, entry.last_seen,
         )
 
@@ -495,6 +538,8 @@ class IdentityManager:
 
             # ── Best frame capture-and-replace (only in capture zones) ────────
             if in_capture:
+                if cid not in self._img_path:
+                    print(f"[Entry][zone] cid={cid} ENTERED zone={current_zone}")
                 self._update_best(cid, conf, crop, state)
 
             # ── COUNTING ──────────────────────────────────────────────────────
@@ -585,13 +630,9 @@ class IdentityManager:
 
 def _rename_worker(src: str, dst: str) -> None:
     try:
-        os.rename(src, dst)
+        shutil.move(src, dst)
     except OSError:
-        try:
-            shutil.copy2(src, dst)
-            os.remove(src)
-        except OSError:
-            pass
+        pass
 
 
 def _discard_worker(path: str) -> None:
@@ -604,13 +645,9 @@ def _discard_worker(path: str) -> None:
 def _archive_worker(src: str, dst: str, track_id: Any,
                     best_conf: float, first_seen: float, last_seen: float) -> None:
     try:
-        os.rename(src, dst)
+        shutil.move(src, dst)
     except OSError:
-        shutil.copy2(src, dst)
-        try:
-            os.remove(src)
-        except OSError:
-            pass
+        pass
     save_person_metadata(track_id, best_conf, first_seen, last_seen, dst)
 
     # Forward to backend WS (non-blocking — dashboard registers this callback)

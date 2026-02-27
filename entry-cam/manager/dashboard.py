@@ -429,12 +429,46 @@ async def gallery_days():
 
 
 # ── Pipeline state ─────────────────────────────────────────────────────────────
-_prev_ids:   set       = set()
-_seen_cache: dict      = {}          # track_id -> first_seen timestamp
-_active_ref: list[int] = [0]         # mutable int so REST can read it
-_last_hb:    float     = 0.0
-_state:      dict      = {}
-_TWO_HOURS             = 7200
+_prev_ids:        set       = set()
+_seen_cache:      dict      = {}          # track_id -> first_seen timestamp
+_active_ref:      list[int] = [0]         # mutable int so REST can read it
+_last_hb:         float     = 0.0
+_last_stats_push: float     = 0.0
+_state:           dict      = {}
+_TWO_HOURS                  = 7200
+
+
+def _push_stats() -> None:
+    """Query DBs and emit a 'stats' event to local WS clients and the backend."""
+    today = _today_epoch()
+    total_row = _q_session("SELECT COUNT(*) AS n FROM session_gallery")
+    today_row = _q_session(
+        "SELECT COUNT(*) AS n FROM session_gallery WHERE first_entry >= ?",
+        (today,),
+    )
+    hourly = _q_session(
+        """
+        SELECT CAST(
+                   strftime('%H', datetime(first_entry, 'unixepoch', 'localtime'))
+               AS INTEGER) AS hour,
+               COUNT(*) AS count
+        FROM   session_gallery
+        WHERE  first_entry >= ?
+        GROUP  BY hour
+        ORDER  BY hour
+        """,
+        (today,),
+    )
+    _stats_payload = {
+        "event":        "stats",
+        "unique_total": total_row[0]["n"] if total_row else 0,
+        "today_count":  today_row[0]["n"] if today_row else 0,
+        "active_now":   _active_ref[0],
+        "hourly":       hourly,
+        "ts":           time.time(),
+    }
+    print(f"[WS→backend] stats  unique={_stats_payload['unique_total']}  today={_stats_payload['today_count']}  active={_stats_payload['active_now']}")
+    _emit(_stats_payload)
 
 
 # ── Pipeline hook ──────────────────────────────────────────────────────────────
@@ -447,8 +481,9 @@ def notify(tracks: list[dict], identity_manager) -> None:
       - exit         : a track_id left the frame (includes dwell time)
       - new_entry    : the global unique-visitor count incremented
       - heartbeat    : sent at most once per second with live counts
+      - stats        : hourly/daily counts, sent every 30 s
     """
-    global _prev_ids, _last_hb, _seen_cache
+    global _prev_ids, _last_hb, _last_stats_push, _seen_cache
 
     now         = time.time()
     current_ids = {t["track_id"] for t in tracks}
@@ -504,6 +539,11 @@ def notify(tracks: list[dict], identity_manager) -> None:
             "ts":           now,
         })
         _last_hb = now
+
+    # ── Periodic stats push (every 30 s) ───────────────────────────────────────
+    if now - _last_stats_push >= 30.0:
+        _push_stats()
+        _last_stats_push = now
 
 
 # ── Server entrypoint ──────────────────────────────────────────────────────────
