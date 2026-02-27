@@ -429,13 +429,14 @@ async def gallery_days():
 
 
 # ── Pipeline state ─────────────────────────────────────────────────────────────
-_prev_ids:        set       = set()
-_seen_cache:      dict      = {}          # track_id -> first_seen timestamp
-_active_ref:      list[int] = [0]         # mutable int so REST can read it
-_last_hb:         float     = 0.0
-_last_stats_push: float     = 0.0
-_state:           dict      = {}
-_TWO_HOURS                  = 7200
+_prev_ids:           set       = set()
+_seen_cache:         dict      = {}          # track_id -> first_seen timestamp
+_active_ref:         list[int] = [0]         # mutable int so REST can read it
+_last_hb:            float     = 0.0
+_last_stats_push:    float     = 0.0
+_state:              dict      = {}
+_TWO_HOURS                     = 7200
+_identity_manager_ref: list    = [None]      # set by notify(); used by _push_stats
 
 
 def _push_stats() -> None:
@@ -485,6 +486,7 @@ def notify(tracks: list[dict], identity_manager) -> None:
     """
     global _prev_ids, _last_hb, _last_stats_push, _seen_cache
 
+    _identity_manager_ref[0] = identity_manager
     now         = time.time()
     current_ids = {t["track_id"] for t in tracks}
     _active_ref[0] = len(current_ids)

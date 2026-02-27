@@ -10,7 +10,7 @@ import os
 # YOLO detection
 # ---------------------------------------------------------------------------
 YOLO_MODEL_PATH           = os.getenv("YOLO_MODEL_PATH", "yolo11n.pt")
-YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.35"))
+YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONF", "0.20"))  # lower = detect more people, even partially visible
 YOLO_IOU_THRESHOLD        = float(os.getenv("YOLO_IOU",  "0.45"))
 YOLO_DEVICE               = os.getenv("YOLO_DEVICE", "cpu")   # "cpu" | "cuda" | "mps"
 YOLO_IMGSZ                = int(os.getenv("YOLO_IMGSZ", "320"))  # inference resolution — 320 is ~3× faster than 640 on CPU
@@ -93,8 +93,9 @@ ENTRY_REID_SIM_THRESHOLD = 0.65
 # typical inter-person similarity so only a genuine same-person match passes.
 #
 # If you see the same person counted twice on a restart → lower this slightly.
-# If different people are suppressed → raise it further toward 0.95.
-ENTRY_SESSION_THRESHOLD = 0.92
+# If different people are suppressed → raise it further toward 0.97.
+# Higher = more unique counts (less likely to treat a new person as returning).
+ENTRY_SESSION_THRESHOLD = 0.95
 
 # Skip recomputing embedding if bbox moved less than this many pixels.
 ENTRY_HIST_SKIP_PX = 2

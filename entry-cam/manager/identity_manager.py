@@ -568,13 +568,13 @@ class IdentityManager:
             s = self._active.pop(gone_cid)
 
             # Path 3: was in inside zone when last seen, never counted via events
-            # Use s.zone (the gone person's actual zone), not loop variable
             if s.zone == _INSIDE_ZONE and not s.counted:
                 self._count_person(gone_cid, s, "exit_inside")
 
-            img_path = self._img_path.get(gone_cid, "")
-            self._lost[gone_cid] = LostEntry(s, img_path, time.time())
-            self._zones.remove(gone_cid)
+            # Path 4: was in detector zone when last seen and never counted.
+            # Catches fast walkers who enter detector but exit before crossing inside.
+            elif s.zone == _DETECTOR_ZONE and not s.counted:
+                self._count_person(gone_cid, s, "exit_detector")
 
         # ── Prune _id_map ──────────────────────────────────────────────────────
         live_cids = set(self._active) | set(self._lost)

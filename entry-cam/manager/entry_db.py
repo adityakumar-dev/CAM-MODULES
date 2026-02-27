@@ -34,7 +34,10 @@ import numpy as np
 
 _DEFAULT_DB_PATH  = os.path.join("output", "entry_session.db")
 _GALLERY_BLEND_ALPHA: float = 0.3
-_MIN_SIM_GAP:         float = 0.06   # FIX2: minimum gap between best and 2nd best
+# Minimum gap between best and 2nd-best similarity before a match is accepted.
+# Lower = less strict = fewer 'ambiguous' rejections = more correct returning-visitor matches.
+# At 0.02 only truly identical scores are rejected.
+_MIN_SIM_GAP:         float = 0.02
 
 
 class EntryDB:
